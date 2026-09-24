@@ -82,7 +82,7 @@ Bu komutların çoğu firmware'de henüz yalnızca log üretir. Fiziksel işlem 
 - `Tronloop.ClusterPilot.Engine.csproj`: .NET 10 Worker; `Microsoft.Extensions.Hosting` ve `Microsoft.Extensions.Hosting.Systemd` 10.0.9, MQTTnet 5.2.0.1603 referansları.
 - `Program.cs`: generic host oluşturur ve `Worker` servis kaydını yapar. Systemd paketi mevcut olsa da burada özel systemd entegrasyon çağrısı yoktur.
 - `CanIsoTpListener.cs`: `libc` P/Invoke üzerinden Linux SocketCAN ISO-TP soketi açar, okur ve yazar. Mevcut taşıma kodu Linux'a yöneliktir.
-- `Worker.cs`: CAN dinleyicilerini başlatır, dummy CAN gönderimini ve MQTT bağlantısını yürütür.
+- `Worker.cs`: CAN dinleyicilerini başlatır ve MQTT bağlantısını yürütür.
 - `appsettings.json`: `can0`, RX=`0x100`, TX=`0x101`; virgülle ayrılmış birden fazla RX/TX çifti desteklenir. Çift sayıları eşit değilse CAN dinleyicileri başlatılmaz.
 
 ### CAN alımı ve ayrıştırma
@@ -149,3 +149,109 @@ Payload'da cihaz zaman damgası ve sıra numarası bulunmadığından kesin öl�
 İlk bağlam incelemesi kaynak kod ve kullanıcının firmware açıklamasıyla yapıldı. Sonraki `ObjectDisposedException` düzeltmesinde CAN görevlerinin iptal/dispose sıralaması ve receive timeout hata davranışı güncellendi. Donanım testi veya canlı MQTT/CAN bağlantısı çalıştırılmadı.
 
 Parser uygulanırken doğrulanmış örnek payload'lar, negatif akım/sıcaklık, hatalı uzunluk ve bilinmeyen mesaj türü test edilmelidir. Ardından Linux CAN ortamında ISO-TP alımı, gerçek cihazla adresleme, kesinti/reconnect ve kayıt bütünlüğü doğrulanmalıdır.
+
+## SQLite binary kayıt — 2026-09-18 güncellemesi
+
+Bu bölüm yukarıdaki ilk kod incelemesinin kayıt/parser hakkındaki durumunu günceller.
+
+- Uzunluğa göre çözümleme `CanIsoTpListener.DeserializePayload` metoduna taşındı. Mevcut 7 baytlık `FastTelemetryPayload` biçimi korunuyor; 11 baytlık firmware biçimi henüz uygulanmadı. Desteklenmeyen uzunluklar uyarıyla atlanır.
+- Çözümlenen struct, `SqliteTelemetryStore.SaveAsync<T>` içinde `MemoryMarshal.Write` ile binary olarak serialize edilir (`T : unmanaged`). JSON ve ölçüm kolonları yoktur.
+- Veritabanı `Telemetry:DatabasePath` ayarından alınır; varsayılan `data/telemetry.sqlite`, uygulamanın content root dizinine göredir. Başlangıçta dosya/tablo oluşturulur. Diğer servis aynı dosyayı açmalıdır.
+- `CanTelemetry`: `Id`, `ReceivedAtUtc` (PC alım zamanı, UTC), `CanInterface`, `RxId`, `TxId`, `Payload` (BLOB), `PayloadLength`, `PayloadType` (ör. `FastTelemetryPayload`), `SentAtUtc` (başlangıçta NULL).
+- Tek gönderici servis bekleyen kayıtları aşağıdaki sorguyla okur; başarılı gönderimden sonra ilgili `Id` için `SentAtUtc` yazar. Bu proje gönderim yapmaz. Gönderim ile işaretleme arasında çökme olursa aynı kayıt tekrar gönderilebilir; alıcı tarafında kayıt kimliğiyle tekrar kontrolü gerekir. Birden çok gönderici için ayrıca atomik sahiplenme gerekir.
+
+```sql
+SELECT Id, PayloadType, Payload, ReceivedAtUtc, CanInterface, RxId, TxId
+FROM CanTelemetry
+WHERE SentAtUtc IS NULL
+ORDER BY Id
+LIMIT 100;
+
+UPDATE CanTelemetry SET SentAtUtc = $sentAtUtc
+WHERE Id = $id AND SentAtUtc IS NULL;
+```
+
+Bilinen tür ve tam uzunluk doğrulandıktan sonra geri okuma:
+
+```csharp
+var telemetry = MemoryMarshal.Read<FastTelemetryPayload>(binaryPayload);
+```
+
+Okuyucu aynı struct düzenini (`Pack=1`), alan türlerini ve byte sırasını kullanmalıdır. Bu format mevcut unmanaged struct'lar içindir; referans alanlı class'lar için genel amaçlı serializer değildir. Tip düzeni değişirse yeni bir tür adı/sürüm kullanılmalıdır.
+
+SQLite WAL ve FULL synchronous ile açılır. SQL yazma hatasında mevcut kayıt bellekte tutularak 2 saniyede bir tekrar denenir; o dinleyici bu sırada yeni CAN okumaz. Uzun arızalarda kernel tamponu dolabilir; kapanışta henüz yazılmamış kayıt kaybolabilir. Sınırsız/kayıpsız bir ara kuyruk garantisi yoktur.
+
+Doğrulama: `dotnet build --no-restore` hatasız/uyarısız tamamlandı. Geçici SQLite dosyasında binary yazma/geri okuma, negatif akım/sıcaklık, dört eşzamanlı yazma, bekleyen kayıt seçimi ve iptal kontrolü geçti. CAN donanım testi yapılmadı.
+
+## MQTT öncelikli gönderim — 2026-09-18 güncellemesi
+
+Önceki SQLite akışının yerini şu davranış alır:
+
+- `TelemetryPublisher.PublishAsync<T>` çözümlenen struct'ı binary olarak MQTT'ye gönderir. QoS 1 kullanılır; broker'ın başarılı publish cevabı alındığında metot döner, SQLite açılmaz/yazılmaz.
+- Bağlantı yoksa, publish sonucu başarısızsa, gönderim hata verirse veya 5 saniyelik gönderim süresi aşılırsa aynı tipli değer SQLite'a binary kaydedilir. Veritabanı ilk başarısız gönderimde oluşturulur.
+- Topic: `tronloop/{ClusterPilot:Id}/vertex-01/base-telemetry`. Kimlik `appsettings.json` içindeki `ClusterPilot:Id` ile belirlenir (varsayılan `clusterpilot-01`); `ClusterPilot__Id=clusterpilot-02` ortam değişkeni bu ayarı ezer. Örnek: `ClusterPilot__Id=clusterpilot-02 dotnet run`. Değişiklik uygulama yeniden başlatıldığında geçerli olur. Tam topic isteğe bağlı `Telemetry:MqttTopic` veya `Telemetry__MqttTopic` ile verilirse kimlikten üretilen topic yerine kullanılır. Sonuna CAN veya tür bilgisi eklenmez. MQTT payload'ı doğrudan struct'ın binary temsilidir. Bu kimlik telemetri topic'i içindir; Worker'ın mevcut `A0` komut/status kimliği ayrıdır.
+- Worker ve publisher aynı MQTT istemcisini kullanır. MQTT bağlantı/heartbeat hataları CAN alımını durdurmaz; Worker 5 saniyelik döngüde bağlantıyı yeniden dener.
+- Başarı broker onayıdır; tüketicinin işlemi tamamladığının onayı değildir. Broker mesajı alıp onayı kaybolursa SQLite fallback aynı mesajı tekrar göndermeye yol açabilir.
+- SQLite'taki eski kayıtlar bu publisher tarafından okunmaz, gönderilmez veya değiştirilmez. Bunları gönderecek ayrı servis için önceki `SentAtUtc` sözleşmesi geçerlidir.
+
+
+## Vertex adres eşlemesi — 2026-09-24
+
+`Can:Devices`, eski `Can:RxIds` / `Can:TxIds` virgüllü listelerinin yerini alır.
+Her kayıt `VertexId`, `RxId`, `TxId` içerir. RX/TX yönleri Pilot tarafına göredir;
+Vertex firmware'inde RX ve TX ters eşlenmelidir. Örnek adresler firmware ile aynı olmalıdır.
+Aynı `can0` üzerinde vertex-01 için 0x100/0x101, vertex-02 için 0x102/0x103,
+vertex-03 için 0x104/0x105 tanımlanmıştır. Kullanılmayan cihaz kayıtları kaldırılabilir.
+Kimlikler ve CAN ID'leri cihazlar arasında benzersiz olmalıdır.
+
+Telemetri topic'i artık `tronloop/{ClusterPilot:Id}/{VertexId}/base-telemetry` olarak üretilir.
+`Telemetry:MqttTopic` override'ında `{VertexId}` yer tutucusu kullanılabilir;
+sabit topic verilirse tüm cihazlar o topic'e yayın yapar.
+Ortam değişkeni örnekleri: `ClusterPilot__Id=clusterpilot-02`,
+`Can__Devices__0__VertexId=vertex-10`, `Can__Devices__0__RxId=0x110`,
+`Can__Devices__0__TxId=0x111`. Ayarlar yeniden başlatmada okunur.
+SQLite kayıtlarında mevcut CAN arayüzü/RX/TX alanları korunur; VertexId ayrıca saklanmaz.
+
+
+## Cihaz aktifliği — 2026-09-24
+
+`Can:Devices` listesinde vertex-01–vertex-16 tanımlıdır; Pilot RX/TX çiftleri
+0x100/0x101 ile başlayıp 0x11E/0x11F ile biter. İlk üç cihaz aktif, diğerleri pasiftir.
+Her cihazın `IsActive` alanı listener açılıp açılmayacağını belirler. `false` olan
+cihaz için socket veya dinleme görevi oluşturulmaz.
+Alan belirtilmezse eski konfigürasyonlarla uyum için `true` kabul edilir.
+Bu alan cihazın çevrimiçi durumunu değil, yapılandırmadaki etkinliğini gösterir.
+Örnek ortam değişkeni: `Can__Devices__3__IsActive=true` vertex-04 cihazını etkinleştirir.
+Değişiklik uygulama yeniden başlatıldığında geçerli olur.
+
+## Listener durum takibi — 2026-09-24
+
+Yalnızca `IsActive=true` cihazlar için listener başlatılır.
+Tüm cihazlar mevcut `tronloop/orchestrator/A0/status` ve `/heartbeat` JSON
+mesajlarının `Devices` dizisinde raporlanır. Heartbeat mevcut 5 saniyelik döngüde,
+MQTT bağlantısı varken gönderilir. Her kayıt `VertexId`, `IsActive`,
+`ListenerState`, `ReceptionState`, `LastReceivedAtUtc`, `ReceivedPackets`,
+`LastError` içerir. Snapshot okumaları ve sayaç güncellemeleri kilitle korunur.
+
+- ListenerState: `inactive`, `starting`, `listening`, `reconnecting`, `faulted`, `stopped`.
+- ReceptionState: `inactive`, hiç paket alınmadığında `waiting`, yakın zamanda paket
+  alındığında `recent`, son paket `Can:StaleAfterSeconds` (varsayılan 30) kadar
+  eskidiğinde `stale`. Bu eşik pozitif olmalıdır; cihazın yayın sıklığına göre ayarlanır.
+- `listening` socket'in açıldığını gösterir; cihazın çevrimiçi olduğunun kanıtı değildir.
+- Sayaç ve son alım zamanı, bilinmeyen payload boyutları dahil tüm alınan ISO-TP
+  paketlerini kapsar. `LastError` son listener hatasının geçmiş bilgisidir;
+  bağlantı düzelince korunur. Bu alanlar firmware'in batarya/state alanından ayrıdır.
+- Başlangıçta socket açılamazsa da listener görevinde yeniden deneme yapılır.
+  Kapanışta socket kapatılır ve durum `stopped` olur.
+- Config aktifliği başlangıçta okunur; `IsActive` değişikliğinde yeniden başlatma gerekir.
+
+Doğrulama: build ve donanımdan bağımsız durum/geçiş kontrolleri;
+gerçek Linux CAN/ISO-TP bağlantısı ve MQTT tüketicisi ile entegrasyon testi yapılmadı.
+
+
+## Dummy gönderimin kaldırılması — 2026-09-24
+
+Otomatik 12 baytlık dummy gönderim görevi ve `SendDummyCanMessagesAsync` metodu
+kaldırıldı. Önceki bölümlerdeki dummy gönderim açıklamaları tarihsel durumu anlatır.
+CAN listener alımı ve yeniden bağlantı denemeleri devam eder; uygulama periyodik
+test payload'ı göndermez. ISO-TP flow-control için TX ID kullanılmaya devam eder.

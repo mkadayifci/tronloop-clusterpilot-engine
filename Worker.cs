@@ -12,6 +12,11 @@ public sealed class Worker : BackgroundService
 {
     private readonly ILogger<Worker> _logger;
     private readonly IConfiguration _configuration;
+    private readonly TelemetryPublisher _telemetryPublisher;
+    private readonly IMqttClient _mqttClient;
+
+    private readonly List<CanDeviceStatus> _deviceStatuses = [];
+    private TimeSpan _staleAfter;
 
     private const string NodeId = "A0";
 
@@ -20,10 +25,12 @@ public sealed class Worker : BackgroundService
         PropertyNameCaseInsensitive = true
     };
 
-    public Worker(ILogger<Worker> logger, IConfiguration configuration)
+    public Worker(ILogger<Worker> logger, IConfiguration configuration, TelemetryPublisher telemetryPublisher, IMqttClient mqttClient)
     {
         _logger = logger;
         _configuration = configuration;
+        _telemetryPublisher = telemetryPublisher;
+        _mqttClient = mqttClient;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -32,46 +39,58 @@ public sealed class Worker : BackgroundService
         List<CanIsoTpListener> canListeners = [];
         List<Task> canTasks = [];
 
+        var staleSeconds = _configuration.GetValue<int>("Can:StaleAfterSeconds", 30);
+        if (staleSeconds <= 0)
+            throw new InvalidOperationException("Can:StaleAfterSeconds must be positive.");
+        _staleAfter = TimeSpan.FromSeconds(staleSeconds);
+
         var canInterface = _configuration["Can:Interface"] ?? "can0";
-        var canRxIds = ParseCanIdList(_configuration["Can:RxIds"]);
-        var canTxIds = ParseCanIdList(_configuration["Can:TxIds"]);
-
-        if (canRxIds.Count != canTxIds.Count)
+        var devices = _configuration.GetSection("Can:Devices").GetChildren()
+            .Select(device => (
+                VertexId: device["VertexId"] ?? "",
+                IsActive: device.GetValue<bool>("IsActive", true),
+                RxId: ParseCanId(device["RxId"]),
+                TxId: ParseCanId(device["TxId"])))
+            .ToList();
+        var vertexIds = new HashSet<string>(StringComparer.Ordinal);
+        var canIds = new HashSet<uint>();
+        foreach (var device in devices)
         {
-            _logger.LogError(
-                "Can:RxIds ({RxCount} entries) and Can:TxIds ({TxCount} entries) must have the same number of comma-separated entries; no CAN listeners started.",
-                canRxIds.Count,
-                canTxIds.Count);
-        }
-        else
-        {
-            for (var i = 0; i < canRxIds.Count; i++)
+            if (string.IsNullOrWhiteSpace(device.VertexId) ||
+                device.VertexId.IndexOfAny(['/', '+', '#', '\0']) >= 0 ||
+                !vertexIds.Add(device.VertexId) ||
+                !canIds.Add(device.RxId) || !canIds.Add(device.TxId))
             {
-                var rxId = canRxIds[i];
-
-
-                var txId = canTxIds[i];
-                var deviceLabel = $"{canInterface} rx=0x{rxId:X} tx=0x{txId:X}";
-
-                try
-                {
-                    var canListener = new CanIsoTpListener(canInterface, rxId, txId, _logger);
-                    canListener.Open();
-                    canListeners.Add(canListener);
-                    canTasks.Add(canListener.ListenAsync(canCancellation.Token));
-                    canTasks.Add(SendDummyCanMessagesAsync(canListener, deviceLabel, canCancellation.Token));
-
-                    _logger.LogInformation("CAN ISO-TP listener started on {Device}", deviceLabel);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to start CAN ISO-TP listener on {Device}", deviceLabel);
-                }
+                throw new InvalidOperationException("Can:Devices requires unique VertexId values (MQTT topic segments) and distinct RX/TX CAN IDs.");
             }
         }
 
-        var factory = new MqttClientFactory();
-        var client = factory.CreateMqttClient();
+        foreach (var device in devices)
+        {
+            var status = new CanDeviceStatus(device.VertexId, device.IsActive);
+            _deviceStatuses.Add(status);
+            if (!device.IsActive)
+            {
+                _logger.LogInformation("CAN listener inactive for {VertexId}", device.VertexId);
+                continue;
+            }
+            var deviceLabel = $"{device.VertexId} {canInterface} rx=0x{device.RxId:X} tx=0x{device.TxId:X}";
+            try
+            {
+                var canListener = new CanIsoTpListener(canInterface, device.RxId, device.TxId,
+                    device.VertexId, _logger, _telemetryPublisher, status);
+                canListeners.Add(canListener);
+                canTasks.Add(canListener.ListenAsync(canCancellation.Token));
+                _logger.LogInformation("CAN ISO-TP listener started on {Device}", deviceLabel);
+            }
+            catch (Exception ex)
+            {
+                status.SetState("faulted", ex.Message);
+                _logger.LogError(ex, "Failed to start CAN ISO-TP listener on {Device}", deviceLabel);
+            }
+        }
+
+        var client = _mqttClient;
 
         client.ApplicationMessageReceivedAsync += async e =>
         {
@@ -112,19 +131,30 @@ public sealed class Worker : BackgroundService
 
         try
         {
-            await client.ConnectAsync(options, stoppingToken);
-
-            _logger.LogInformation("MQTT Connected");
-            _logger.LogInformation("This is the new version CAN");
-
-            await client.SubscribeAsync($"tronloop/node/{NodeId}/cmd", cancellationToken: stoppingToken);
-            await client.SubscribeAsync("tronloop/broadcast/cmd", cancellationToken: stoppingToken);
-
-            await PublishStatus(client, "online", stoppingToken);
-
             while (!stoppingToken.IsCancellationRequested)
             {
-                await PublishHeartbeat(client, stoppingToken);
+                try
+                {
+                    if (!client.IsConnected)
+                    {
+                        await client.ConnectAsync(options, stoppingToken);
+                        await client.SubscribeAsync($"tronloop/node/{NodeId}/cmd", cancellationToken: stoppingToken);
+                        await client.SubscribeAsync("tronloop/broadcast/cmd", cancellationToken: stoppingToken);
+                        await PublishStatus(client, "online", stoppingToken);
+                        _logger.LogInformation("MQTT Connected");
+                    }
+
+                    await PublishHeartbeat(client, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "MQTT unavailable; CAN reception continues with SQLite fallback.");
+                }
+
                 await Task.Delay(5000, stoppingToken);
             }
         }
@@ -139,7 +169,7 @@ public sealed class Worker : BackgroundService
         finally
         {
             // MQTT failures can reach here without the host's stoppingToken being cancelled.
-            // Stop both CAN loops and wait for in-flight I/O before disposing their sockets.
+            // Stop CAN listeners and wait for in-flight I/O before disposing their sockets.
             canCancellation.Cancel();
 
             foreach (var canTask in canTasks)
@@ -178,49 +208,11 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private async Task SendDummyCanMessagesAsync(CanIsoTpListener canListener, string deviceLabel, CancellationToken cancellationToken)
-    {
-        uint counter = 0;
-        _logger.LogWarning("Trying to send dummy ISO-TP message to {Device}", deviceLabel);
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            var payload = new byte[12];
-            BitConverter.GetBytes(counter).CopyTo(payload, 0);
-            counter++;
-
-            try
-            {
-                canListener.Send(payload);
-                _logger.LogWarning("Sent dummy ISO-TP message to {Device}", deviceLabel);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to send dummy ISO-TP message to {Device}", deviceLabel);
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
-        }
-    }
-
-    private static List<uint> ParseCanIdList(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return [];
-        }
-
-        return value
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(ParseCanId)
-            .ToList();
-    }
-
     private static uint ParseCanId(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
         {
-            return 0;
+            throw new InvalidOperationException("Each Can:Devices entry requires RxId and TxId.");
         }
 
         var trimmed = value.Trim();
@@ -286,7 +278,13 @@ public sealed class Worker : BackgroundService
         await client.PublishAsync(mqttMessage, cancellationToken);
     }
 
-    private static async Task PublishStatus(
+    private CanDeviceSnapshot[] GetDeviceSnapshots()
+    {
+        var now = DateTimeOffset.UtcNow;
+        return _deviceStatuses.Select(status => status.Snapshot(now, _staleAfter)).ToArray();
+    }
+
+    private async Task PublishStatus(
         IMqttClient client,
         string state,
         CancellationToken cancellationToken)
@@ -295,6 +293,7 @@ public sealed class Worker : BackgroundService
         {
             NodeId = NodeId,
             State = state,
+            Devices = GetDeviceSnapshots(),
             TimestampUtc = DateTimeOffset.UtcNow
         };
 
@@ -306,7 +305,7 @@ public sealed class Worker : BackgroundService
         await client.PublishAsync(message, cancellationToken);
     }
 
-    private static async Task PublishHeartbeat(
+    private async Task PublishHeartbeat(
         IMqttClient client,
         CancellationToken cancellationToken)
     {
@@ -314,6 +313,7 @@ public sealed class Worker : BackgroundService
         {
             NodeId = NodeId,
             State = "alive",
+            Devices = GetDeviceSnapshots(),
             TimestampUtc = DateTimeOffset.UtcNow
         };
 
@@ -343,6 +343,7 @@ public sealed class CommandAck
 
 public sealed class NodeStatus
 {
+    public CanDeviceSnapshot[] Devices { get; set; } = [];
     public string NodeId { get; set; } = "";
     public string State { get; set; } = "";
     public DateTimeOffset TimestampUtc { get; set; }

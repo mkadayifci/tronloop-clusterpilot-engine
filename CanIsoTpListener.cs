@@ -21,20 +21,26 @@ public sealed class CanIsoTpListener : IDisposable
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(2);
 
     private readonly string _interfaceName;
+    private readonly string _vertexId;
     private readonly uint _rxId;
     private readonly uint _txId;
     private readonly ILogger _logger;
+    private readonly TelemetryPublisher _telemetryPublisher;
+    private readonly CanDeviceStatus _status;
     private readonly object _sync = new();
 
     private int _socketFd = -1;
     private bool _disposed;
 
-    public CanIsoTpListener(string interfaceName, uint rxId, uint txId, ILogger logger)
+    public CanIsoTpListener(string interfaceName, uint rxId, uint txId, string vertexId, ILogger logger, TelemetryPublisher telemetryPublisher, CanDeviceStatus status)
     {
+        _status = status;
         _interfaceName = interfaceName;
+        _vertexId = vertexId;
         _rxId = rxId;
         _txId = txId;
         _logger = logger;
+        _telemetryPublisher = telemetryPublisher;
     }
 
     public void Open()
@@ -49,6 +55,7 @@ public sealed class CanIsoTpListener : IDisposable
             }
 
             _socketFd = OpenSocket();
+            _status.SetState("listening");
         }
     }
 
@@ -62,67 +69,91 @@ public sealed class CanIsoTpListener : IDisposable
         {
             var buffer = new byte[4096];
 
-            while (!cancellationToken.IsCancellationRequested)
+            try
             {
-                try
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    EnsureOpen();
-
-                    var fd = GetSocketFd();
-                    var bytesRead = read(fd, buffer, buffer.Length);
-
-                    if (bytesRead > 0)
+                    try
                     {
-                        var hex = Convert.ToHexString(buffer, 0, (int)bytesRead);
-                        //Console.WriteLine($"[ISO-TP] {DateTime.Now:HH:mm:ss.fff} <- {hex}");
-                        //_logger.LogInformation("ISO-TP RX [{Length} bytes]: {Hex}", bytesRead, hex);
+                        EnsureOpen();
 
-                        if (bytesRead == Marshal.SizeOf<FastTelemetryPayload>())
+                        var fd = GetSocketFd();
+                        var bytesRead = read(fd, buffer, buffer.Length);
+
+                        if (bytesRead > 0)
                         {
-                            var telemetry = MemoryMarshal.Read<FastTelemetryPayload>(buffer.AsSpan(0, (int)bytesRead));
+                            var receivedAtUtc = DateTimeOffset.UtcNow;
+                            _status.RecordReceived(receivedAtUtc);
+                            var telemetry = DeserializePayload(buffer.AsSpan(0, (int)bytesRead));
+                            if (telemetry is FastTelemetryPayload fastTelemetry)
+                            {
+                                await _telemetryPublisher.PublishAsync(
+                                    _vertexId, _interfaceName, _rxId, _txId, receivedAtUtc,
+                                    fastTelemetry, cancellationToken);
+                                _logger.LogInformation(
+                                    "Fast telemetry: voltage={VoltageMv} mV, current={CurrentMa} mA, temp={TempC:F1} C, state={State}",
+                                    fastTelemetry.BatteryVoltageMv,
+                                    fastTelemetry.BatteryCurrentMa,
+                                    fastTelemetry.BatteryTempDeciC / 10.0,
+                                    fastTelemetry.State);
+                            }
+                            else
+                            {
+                                _logger.LogWarning("Unsupported ISO-TP payload length {Length}; packet not stored.", bytesRead);
+                            }
 
-                            _logger.LogInformation(
-                                "Fast telemetry: voltage={VoltageMv} mV, current={CurrentMa} mA, temp={TempC:F1} C, state={State}",
-                                telemetry.BatteryVoltageMv,
-                                telemetry.BatteryCurrentMa,
-                                telemetry.BatteryTempDeciC / 10.0,
-                                telemetry.State);
-                        }
-
-                        continue;
-                    }
-
-                    if (bytesRead < 0)
-                    {
-                        var errno = Marshal.GetLastWin32Error();
-
-                        if (errno is EAGAIN or EWOULDBLOCK or ETIMEDOUT)
-                        {
                             continue;
                         }
 
-                        _logger.LogWarning("ISO-TP read error (errno={Errno}); reconnecting socket.", errno);
-
-                        CloseSocketSafely();
-
-                        if (IsFatalSocketError(errno))
+                        if (bytesRead < 0)
                         {
-                            await DelayBeforeReconnect(cancellationToken);
+                            var errno = Marshal.GetLastWin32Error();
+
+                            if (errno is EAGAIN or EWOULDBLOCK or ETIMEDOUT)
+                            {
+                                continue;
+                            }
+
+                            _logger.LogWarning("ISO-TP read error (errno={Errno}); reconnecting socket.", errno);
+
+                            _status.SetState("reconnecting", $"ISO-TP read error: errno={errno}");
+                            CloseSocketSafely();
+
+                            if (IsFatalSocketError(errno))
+                            {
+                                await DelayBeforeReconnect(cancellationToken);
+                            }
                         }
                     }
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "ISO-TP listener failed; will retry.");
-                    CloseSocketSafely();
-                    await DelayBeforeReconnect(cancellationToken);
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        _status.SetState("reconnecting", ex.Message);
+                        _logger.LogWarning(ex, "ISO-TP listener failed; will retry.");
+                        CloseSocketSafely();
+                        await DelayBeforeReconnect(cancellationToken);
+                    }
                 }
             }
-        }, cancellationToken);
+            finally
+            {
+                CloseSocketSafely();
+                _status.SetState("stopped");
+            }
+        }, CancellationToken.None);
+    }
+
+    private static object? DeserializePayload(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length == Marshal.SizeOf<FastTelemetryPayload>())
+        {
+            return MemoryMarshal.Read<FastTelemetryPayload>(payload);
+        }
+
+        return null;
     }
 
     private void EnsureOpen()
@@ -137,6 +168,7 @@ public sealed class CanIsoTpListener : IDisposable
             }
 
             _socketFd = OpenSocket();
+            _status.SetState("listening");
         }
     }
 
@@ -256,6 +288,7 @@ public sealed class CanIsoTpListener : IDisposable
             }
 
             _disposed = true;
+            _status.SetState("stopped");
 
             if (_socketFd >= 0)
             {
