@@ -1,5 +1,27 @@
 # tronloop-clusterpilot-engine — Proje ve firmware bağlamı
 
+## Güncel telemetri — 2026-09-25
+
+Firmware `tl_payloads.h` ile eşleşen model `Models/VertexTelemetryPayload.cs`.
+Paket 13 bayt: byte tür (0x01), ushort mV, short mA, ulong Unix ms.
+Çok baytlı alanlar little-endian; `MeasurementTimeMs` ofseti 5. Eski 8 baytlık
+`FastTelemetryPayload` modeli kaldırıldı. Sıcaklık ve State telemetride yok.
+
+MQTT topic’i `tronloop/{ClusterPilot:Id}/{VertexId}/base-telemetry` olarak kaldı.
+JSON alanları `PayloadType`, `BatteryVoltageMv`, `BatteryCurrentMa`,
+`MeasurementTimeMs`. RTC’den gelen zaman değiştirilmeden yayınlanıyor. Başarısız
+yayında SQLite 13 baytı ve yeni tür adını saklıyor. Eski BLOB’lar dönüştürülmüyor;
+yeniden gönderici eski/yeni tür ve boyutu ayırmalı.
+
+Bu bölüm telemetri için aşağıdaki eski 7/8/11 bayt değerlendirmelerinin yerine geçer.
+Aşağıdaki önceki incelemeler tarihçe olarak korunuyor. Yerel derleme ve 22 davranış
+kontrolü geçti: paket boyut/ofseti, signed akım, uint64 zaman, JSON çıkışı, SQLite
+BLOB ve status/heartbeat regresyonları. MQTT istemcisi taklit edildi, SQLite gerçek
+geçici dosyada denendi. NuGet güvenlik verisi sorgusunda NU1900 erişim uyarısı vardı.
+Canlı broker/CAN denemesi ve canlıya dağıtım yapılmadı.
+
+
+
 Son inceleme: 2026-09-18.
 
 Bu dosya, sonraki geliştirmelerde kullanılacak proje bağlamını, mevcut kodun durumunu ve firmware ile uzlaştırılması gereken protokol ayrıntılarını tutar. Kaynaklar: bu depodaki C# dosyaları ve kullanıcının firmware agentından aktardığı açıklama. Firmware kaynakları veya gerçek CAN trafiği bu incelemede doğrulanmadı. Aşağıdaki öneriler henüz uygulanmış özellikler değildir.

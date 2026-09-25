@@ -23,10 +23,10 @@ public static class CanPackage
         switch ((PayloadType)payload[0])
         {
             case PayloadType.FastTelemetry:
-                if (payload.Length == FastTelemetryPayload.WireSize)
-                    value = FastTelemetryPayload.Parse(payload);
+                if (payload.Length == VertexTelemetryPayload.WireSize)
+                    value = VertexTelemetryPayload.Parse(payload);
                 else
-                    error = $"FastTelemetry requires {FastTelemetryPayload.WireSize} bytes; received {payload.Length}.";
+                    error = $"VertexTelemetry requires {VertexTelemetryPayload.WireSize} bytes; received {payload.Length}.";
                 break;
             case PayloadType.VertexStatus:
                 if (payload.Length == VertexStatusPayload.WireSize)

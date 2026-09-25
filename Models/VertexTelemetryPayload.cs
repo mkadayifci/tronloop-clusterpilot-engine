@@ -4,28 +4,27 @@ using System.Runtime.InteropServices;
 namespace Tronloop.ClusterPilot.Engine.Models;
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
-public readonly struct FastTelemetryPayload
+public readonly struct VertexTelemetryPayload
 {
-    public const int WireSize = 8;
+    public const int WireSize = 13;
     public readonly byte PayloadType;
     public readonly ushort BatteryVoltageMv;
     public readonly short BatteryCurrentMa;
-    public readonly short BatteryTempDeciC;
-    public readonly byte State;
+    // Unix milliseconds supplied by the Vertex RTC; never replaced with receive time.
+    public readonly ulong MeasurementTimeMs;
 
-    private FastTelemetryPayload(ReadOnlySpan<byte> payload)
+    private VertexTelemetryPayload(ReadOnlySpan<byte> payload)
     {
         PayloadType = payload[0];
         BatteryVoltageMv = BinaryPrimitives.ReadUInt16LittleEndian(payload[1..3]);
         BatteryCurrentMa = BinaryPrimitives.ReadInt16LittleEndian(payload[3..5]);
-        BatteryTempDeciC = BinaryPrimitives.ReadInt16LittleEndian(payload[5..7]);
-        State = payload[7];
+        MeasurementTimeMs = BinaryPrimitives.ReadUInt64LittleEndian(payload[5..13]);
     }
 
-    public static FastTelemetryPayload Parse(ReadOnlySpan<byte> payload)
+    public static VertexTelemetryPayload Parse(ReadOnlySpan<byte> payload)
     {
         if (payload.Length != WireSize || payload[0] != (byte)Tronloop.ClusterPilot.Engine.PayloadType.FastTelemetry)
-            throw new ArgumentException("Expected an 8-byte FastTelemetry payload with type 0x01.", nameof(payload));
-        return new FastTelemetryPayload(payload);
+            throw new ArgumentException("Expected a 13-byte VertexTelemetry payload with type 0x01.", nameof(payload));
+        return new VertexTelemetryPayload(payload);
     }
 }

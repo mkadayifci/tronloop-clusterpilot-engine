@@ -90,17 +90,16 @@ public sealed class CanIsoTpListener : IDisposable
                                 _logger.LogWarning("Vertex {VertexId}: {Error} Packet not stored.", _vertexId, error);
                                 continue;
                             }
-                            if (telemetry is FastTelemetryPayload fastTelemetry)
+                            if (telemetry is VertexTelemetryPayload vertexTelemetry)
                             {
                                 await _mqttMessagePublisher.PublishAsync(
                                     _vertexId, _interfaceName, _rxId, _txId, receivedAtUtc,
-                                    fastTelemetry, cancellationToken);
+                                    vertexTelemetry, cancellationToken);
                                 _logger.LogInformation(
-                                    "Fast telemetry: voltage={VoltageMv} mV, current={CurrentMa} mA, temp={TempC:F1} C, state={State}",
-                                    fastTelemetry.BatteryVoltageMv,
-                                    fastTelemetry.BatteryCurrentMa,
-                                    fastTelemetry.BatteryTempDeciC / 10.0,
-                                    fastTelemetry.State);
+                                    "Vertex {VertexId} telemetry: voltage={VoltageMv} mV, current={CurrentMa} mA, measurement time={MeasurementTimeMs} Unix ms",
+                                    _vertexId, vertexTelemetry.BatteryVoltageMv,
+                                    vertexTelemetry.BatteryCurrentMa,
+                                    vertexTelemetry.MeasurementTimeMs);
                             }
                             else if (telemetry is VertexStatusPayload vertexStatus)
                             {
