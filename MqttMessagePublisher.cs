@@ -9,6 +9,8 @@ public sealed class MqttMessagePublisher(
     IMqttClient client, SqliteTelemetryStore store,
     IConfiguration configuration, ILogger<MqttMessagePublisher> logger)
 {
+    internal const uint StatusExpirySeconds = 15;
+
     // CAN payload structs expose public readonly fields instead of properties.
     private static readonly JsonSerializerOptions PayloadJsonOptions = new()
     {
@@ -38,7 +40,8 @@ public sealed class MqttMessagePublisher(
         string vertexId, string canInterface, uint rxId, uint txId, DateTimeOffset receivedAtUtc,
         T payload, CancellationToken cancellationToken) where T : unmanaged
     {
-        var messageType = typeof(T) == typeof(VertexStatusPayload) ? "vertex-status" : "base-telemetry";
+        var isStatus = typeof(T) == typeof(VertexStatusPayload);
+        var messageType = isStatus ? "vertex-status" : "base-telemetry";
         var topic = _topicTemplate
             .Replace("{VertexId}", vertexId, StringComparison.Ordinal)
             .Replace("{MessageType}", messageType, StringComparison.Ordinal);
@@ -49,23 +52,33 @@ public sealed class MqttMessagePublisher(
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeout.CancelAfter(TimeSpan.FromSeconds(5));
-                var message = new MqttApplicationMessageBuilder()
+                var builder = new MqttApplicationMessageBuilder()
                     .WithTopic(topic)
                     .WithPayload(JsonSerializer.SerializeToUtf8Bytes(payload, PayloadJsonOptions))
-                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-                    .Build();
-                var result = await client.PublishAsync(message, timeout.Token);
+                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce);
+                if (isStatus)
+                {
+                    builder.WithMessageExpiryInterval(StatusExpirySeconds);
+                }
+                var result = await client.PublishAsync(builder.Build(), timeout.Token);
                 if (result.IsSuccess)
                 {
                     return;
                 }
 
-                logger.LogWarning("MQTT telemetry rejected ({ReasonCode}); saving to SQLite.", result.ReasonCode);
+                logger.LogWarning("MQTT publish rejected ({ReasonCode}) for {MessageType}.", result.ReasonCode, messageType);
             }
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "MQTT telemetry publish failed; saving to SQLite.");
+            logger.LogWarning(ex, "MQTT publish failed for {MessageType}.", messageType);
+        }
+
+        // Status describes the present; the next CAN status replaces a missed one.
+        if (isStatus)
+        {
+            logger.LogDebug("Skipping undelivered status for {VertexId}; waiting for the next update.", vertexId);
+            return;
         }
 
         // Give an already received packet a short chance to persist during shutdown.

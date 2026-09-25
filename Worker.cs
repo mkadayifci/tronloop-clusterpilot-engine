@@ -5,6 +5,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using MQTTnet;
+using MQTTnet.Formatter;
 using Tronloop.ClusterPilot.Engine.Models;
 
 namespace Tronloop.ClusterPilot.Engine;
@@ -134,6 +135,7 @@ public sealed class Worker : BackgroundService
         };
 
         var options = new MqttClientOptionsBuilder()
+            .WithProtocolVersion(MqttProtocolVersion.V500)
             .WithTcpServer("mqtt.tronloop-lab.com", 1883)
             .WithClientId($"engine-{_clusterPilotId}")
             .Build();
@@ -150,10 +152,10 @@ public sealed class Worker : BackgroundService
                         await client.ConnectAsync(options, stoppingToken);
                         await client.SubscribeAsync($"tronloop/node/{NodeId}/cmd", cancellationToken: stoppingToken);
                         await client.SubscribeAsync("tronloop/broadcast/cmd", cancellationToken: stoppingToken);
-                        await PublishStatus(client, "online", stoppingToken);
-                        _logger.LogInformation("MQTT Connected-Subscribed-Published status");
+                        _logger.LogInformation("MQTT Connected-Subscribed");
                     }
 
+                    await PublishStatus(client, "online", stoppingToken);
                     await PublishHeartbeat(client, stoppingToken);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -311,6 +313,7 @@ public sealed class Worker : BackgroundService
         var message = new MqttApplicationMessageBuilder()
             .WithTopic($"tronloop/orchestrator/{NodeId}/status")
             .WithPayload(JsonSerializer.Serialize(status))
+            .WithMessageExpiryInterval(MqttMessagePublisher.StatusExpirySeconds)
             .Build();
 
         await client.PublishAsync(message, cancellationToken);
