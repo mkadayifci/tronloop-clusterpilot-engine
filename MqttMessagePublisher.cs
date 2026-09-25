@@ -1,5 +1,4 @@
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
+using System.Text.Json;
 using MQTTnet;
 using MQTTnet.Protocol;
 using Tronloop.ClusterPilot.Engine.Models;
@@ -10,6 +9,12 @@ public sealed class MqttMessagePublisher(
     IMqttClient client, SqliteTelemetryStore store,
     IConfiguration configuration, ILogger<MqttMessagePublisher> logger)
 {
+    // CAN payload structs expose public readonly fields instead of properties.
+    private static readonly JsonSerializerOptions PayloadJsonOptions = new()
+    {
+        IncludeFields = true
+    };
+
     private readonly string _topicTemplate = ResolveTopic(configuration);
 
     private static string ResolveTopic(IConfiguration configuration)
@@ -33,8 +38,6 @@ public sealed class MqttMessagePublisher(
         string vertexId, string canInterface, uint rxId, uint txId, DateTimeOffset receivedAtUtc,
         T payload, CancellationToken cancellationToken) where T : unmanaged
     {
-        var binaryPayload = new byte[Unsafe.SizeOf<T>()];
-        MemoryMarshal.Write(binaryPayload, in payload);
         var messageType = typeof(T) == typeof(VertexStatusPayload) ? "vertex-status" : "base-telemetry";
         var topic = _topicTemplate
             .Replace("{VertexId}", vertexId, StringComparison.Ordinal)
@@ -48,7 +51,7 @@ public sealed class MqttMessagePublisher(
                 timeout.CancelAfter(TimeSpan.FromSeconds(5));
                 var message = new MqttApplicationMessageBuilder()
                     .WithTopic(topic)
-                    .WithPayload(binaryPayload)
+                    .WithPayload(JsonSerializer.SerializeToUtf8Bytes(payload, PayloadJsonOptions))
                     .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
                     .Build();
                 var result = await client.PublishAsync(message, timeout.Token);

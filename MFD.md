@@ -183,13 +183,16 @@ SQLite WAL ve FULL synchronous ile açılır. SQL yazma hatasında mevcut kayıt
 
 Doğrulama: `dotnet build --no-restore` hatasız/uyarısız tamamlandı. Geçici SQLite dosyasında binary yazma/geri okuma, negatif akım/sıcaklık, dört eşzamanlı yazma, bekleyen kayıt seçimi ve iptal kontrolü geçti. CAN donanım testi yapılmadı.
 
-## MQTT öncelikli gönderim — 2026-09-18 güncellemesi
+## MQTT öncelikli gönderim — 2026-09-25 güncellemesi
 
-Önceki SQLite akışının yerini şu davranış alır:
+2026-09-18'de eklenen MQTT öncelikli gönderim akışını koruyoruz. 2026-09-25'ten
+itibaren MQTT payload'ı UTF-8 JSON; CAN verisi ve SQLite fallback kaydı binary kalır.
+Kaynak: `MqttMessagePublisher.cs`, `Models/VertexStatusPayload.cs`,
+`Models/FastTelemetryPayload.cs`, `SqliteTelemetryStore.cs`.
 
-- `MqttMessagePublisher.PublishAsync<T>` çözümlenen struct'ı binary olarak MQTT'ye gönderir. QoS 1 kullanılır; broker'ın başarılı publish cevabı alındığında metot döner, SQLite açılmaz/yazılmaz.
+- `MqttMessagePublisher.PublishAsync<T>` çözümlenen struct'ı UTF-8 JSON olarak MQTT'ye gönderir. `JsonSerializerOptions.IncludeFields=true` ile public readonly alanlar da yazılır; PascalCase alan adları ve sayısal değerler korunur. QoS 1 kullanılır; broker'ın başarılı publish cevabı alındığında metot döner, SQLite açılmaz/yazılmaz.
 - Bağlantı yoksa, publish sonucu başarısızsa, gönderim hata verirse veya 5 saniyelik gönderim süresi aşılırsa aynı tipli değer SQLite'a binary kaydedilir. Veritabanı ilk başarısız gönderimde oluşturulur.
-- Topic: `tronloop/{ClusterPilot:Id}/vertex-01/base-telemetry`. Kimlik `appsettings.json` içindeki `ClusterPilot:Id` ile belirlenir (varsayılan `clusterpilot-01`); `ClusterPilot__Id=clusterpilot-02` ortam değişkeni bu ayarı ezer. Örnek: `ClusterPilot__Id=clusterpilot-02 dotnet run`. Değişiklik uygulama yeniden başlatıldığında geçerli olur. Tam topic isteğe bağlı `Telemetry:MqttTopic` veya `Telemetry__MqttTopic` ile verilirse kimlikten üretilen topic yerine kullanılır. Sonuna CAN veya tür bilgisi eklenmez. MQTT payload'ı doğrudan struct'ın binary temsilidir. Bu kimlik telemetri topic'i içindir; Worker'ın mevcut `A0` komut/status kimliği ayrıdır.
+- Topic: `tronloop/{ClusterPilot:Id}/{VertexId}/{MessageType}`. `VertexStatusPayload` için son bölüm `vertex-status`, `FastTelemetryPayload` için `base-telemetry` olur. Kimlik `appsettings.json` içindeki `ClusterPilot:Id` ile belirlenir (varsayılan `clusterpilot-01`); `ClusterPilot__Id=clusterpilot-02` ortam değişkeni bu ayarı ezer. Örnek: `ClusterPilot__Id=clusterpilot-02 dotnet run`. Değişiklik uygulama yeniden başlatıldığında geçerli olur. `Telemetry:MqttTopic` veya `Telemetry__MqttTopic` override'ı verilirse varsayılan topic yerine kullanılır; `{VertexId}` ve `{MessageType}` yer tutucuları desteklenir. Kaynak kimlikleri topic'tedir; telemetri JSON'una ayrıca kimlik veya zaman damgası eklenmez. Worker'ın mevcut `A0` komut/status kimliği ayrıdır.
 - Worker ve publisher aynı MQTT istemcisini kullanır. MQTT bağlantı/heartbeat hataları CAN alımını durdurmaz; Worker 5 saniyelik döngüde bağlantıyı yeniden dener.
 - Başarı broker onayıdır; tüketicinin işlemi tamamladığının onayı değildir. Broker mesajı alıp onayı kaybolursa SQLite fallback aynı mesajı tekrar göndermeye yol açabilir.
 - SQLite'taki eski kayıtlar bu publisher tarafından okunmaz, gönderilmez veya değiştirilmez. Bunları gönderecek ayrı servis için önceki `SentAtUtc` sözleşmesi geçerlidir.
@@ -259,6 +262,10 @@ test payload'ı göndermez. ISO-TP flow-control için TX ID kullanılmaya devam 
 
 ## VertexStatusPayload — 11 bayt firmware biçimi
 
+Bu bölüm ilk uygulamayı anlatır. Uzunluğa göre tür seçimi ve 7 baytlık eski
+FastTelemetry desteği aşağıdaki payload type güncellemesiyle kaldırıldı;
+buradaki binary MQTT yayını da 2026-09-25'te JSON ile değiştirildi.
+
 11 baytlık mesajlar artık `VertexStatusPayload` olarak çözümlenir; eski 7 baytlık
 `FastTelemetryPayload` desteği de korunur. Alan sırası: byte PayloadType,
 ushort BatteryVoltageMv, byte ScenarioPlayerState, byte ChargerMode,
@@ -281,8 +288,9 @@ Tür artık ilk bayttan seçilir: 0x01 FastTelemetry, 0x02 Heartbeat, 0x03 Verte
 Uzunluk yalnızca seçilen türün şemasını doğrular; boyuttan türe geri dönüş yoktur.
 FastTelemetry mevcut alanlarının önüne tür baytı eklenerek 8 bayt oldu;
 eski tür baytı olmayan 7 baytlık paketler desteklenmez. VertexStatus 11 bayttır.
-Her iki parser little-endian okur ve tür/boyut doğrular. MQTT/SQLite binary
-verisi tür baytını da içerir. Önceden kaydedilmiş 7 baytlık FastTelemetry kayıtları
+Her iki parser little-endian okur ve tür/boyut doğrular. CAN ve SQLite binary
+verisi tür baytını da içerir; MQTT JSON'unda aynı değer sayısal `PayloadType`
+alanıdır. Önceden kaydedilmiş 7 baytlık FastTelemetry kayıtları
 bu değişiklikle dönüştürülmez; okuyucular PayloadLength ile eski biçimi ayırmalıdır.
 Heartbeat kodu tanınır ancak gövde şeması henüz verilmediği için loglanıp atlanır.
 Bilinmeyen türler ve hatalı boyutlar da loglanıp atlanır; socket yeniden açılmaz.
@@ -308,6 +316,32 @@ durumlarını içerir. Bu mesaj Engine'in çalıştığını bildirir, Vertex'le
 olduğunu tek başına kanıtlamaz. MQTT istemcisinde tüm ClusterPilot heartbeat'lerini
 izlemek için `tronloop/+/heartbeat` konusuna abone olunabilir.
 
+`tronloop/clusterpilot-01/heartbeat` için örnek payload:
+
+```json
+{
+  "ClusterPilotId": "clusterpilot-01",
+  "State": "alive",
+  "Devices": [
+    {
+      "VertexId": "vertex-01",
+      "IsInstalled": true,
+      "ListenerState": "listening",
+      "ReceptionState": "recent",
+      "LastReceivedAtUtc": "2026-09-25T09:00:04+00:00",
+      "ReceivedPackets": 128,
+      "LastError": null
+    }
+  ],
+  "TimestampUtc": "2026-09-25T09:00:05+00:00"
+}
+```
+
+Örnekte yalnızca bir cihaz var. Gerçek yayında `Can:Devices` içindeki tüm cihazlar,
+`IsInstalled=false` olanlar dahil, `Devices` dizisinde yer alır. Henüz paket
+alınmamış cihazın `LastReceivedAtUtc` alanı `null` olur. Bu JSON'un mevcut modeli
+`Models/ClusterPilotHeartbeat.cs`; cihaz alanlarının kaynağı `CanDeviceStatus.cs`.
+
 Önceki `tronloop/orchestrator/A0/heartbeat` yayını bu topic'e taşındı;
 heartbeat tüketicileri topic'i ve `NodeId` yerine `ClusterPilotId` alanını kullanmalı.
 Komut, ack ve status topic'leri mevcut `A0` yapısında devam eder.
@@ -317,10 +351,48 @@ istemcisiyle heartbeat'ler yaklaşık 0,05 / 5,03 / 10,03 saniyede gözlendi; to
 JSON alanları, istemci kimliği, geçersiz kimliklerin reddi ve temiz kapanış kontrol
 edildi. Gerçek broker/CAN bağlantısıyla entegrasyon testi yapılmadı.
 
-## Vertex status MQTT topic
+## Vertex status MQTT topic ve JSON payload — 2026-09-25
 
 `VertexStatusPayload` artık varsayılan olarak
 `tronloop/{ClusterPilot:Id}/{VertexId}/vertex-status` topic'ine gönderilir.
 Diğer payload'larda mevcut `base-telemetry` son eki korunur.
 `Telemetry:MqttTopic` override'ı `{VertexId}` yanında `{MessageType}` yer tutucusunu
 kullanabilir. Tam sabit topic override'ı verilirse yine önceliklidir.
+
+`tronloop/clusterpilot-01/vertex-01/vertex-status` için örnek payload:
+
+```json
+{
+  "PayloadType": 3,
+  "BatteryVoltageMv": 3700,
+  "ScenarioPlayerState": 1,
+  "ChargerMode": 0,
+  "BatteryCurrentMa": -250,
+  "BatteryTemperatureDc": 245,
+  "AmbientTemperatureDc": 230
+}
+```
+
+Değerler gösterim içindir; gerçek ölçüm değildir. Akım mA, voltaj mV, sıcaklıklar
+derece C'nin onda biri olarak kalır: örneğin `245`, 24,5 °C demektir. Akımın işareti
+korunur; pozitif şarj, negatif deşarjdır. `ScenarioPlayerState` ve `ChargerMode`
+ham sayısal kodlardır; bu örnek kodlara bir durum adı atamaz. Voltaj ve charger mode
+context alanlarıdır; tek başına ölçümün veya donanım geri bildiriminin kanıtı değildir.
+
+`FastTelemetryPayload` da `base-telemetry` topic'inde UTF-8 JSON gönderilir;
+alanları `PayloadType` (`1`), `BatteryVoltageMv`, `BatteryCurrentMa`,
+`BatteryTempDeciC` ve `State`'tir. Her iki payload'da public readonly alanlar
+`IncludeFields=true` ile seri hale gelir; `WireSize` sabiti JSON'a yazılmaz.
+Kaynak: `MqttMessagePublisher.cs`, `Models/VertexStatusPayload.cs`,
+`Models/FastTelemetryPayload.cs`.
+
+Bu değişiklik MQTT tüketicisinin payload çözümlemesini etkiler: aynı topic'lerde
+artık struct baytları yerine JSON okunmalıdır. CAN paket düzeni, topic seçimi,
+QoS 1 ve başarısız yayındaki binary SQLite fallback davranışı korunur.
+
+Doğrulama: `dotnet build --no-restore` hatasız ve uyarısız geçti. Ağsız MQTT
+istemcisiyle iki modelin UTF-8 JSON alanları, negatif sayıları, topic override'ları,
+QoS 1 ve başarılı yayında veritabanı oluşturulmaması kontrol edildi. Bağlantısız,
+reddedilen ve hata veren gönderimlerde SQLite BLOB'larının orijinal 11/8 baytı
+koruduğu doğrulandı; heartbeat JSON alanları da kontrol edildi. Canlı broker ve
+CAN donanımıyla bu JSON değişikliğinin entegrasyon testi yapılmadı.
