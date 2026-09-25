@@ -1,0 +1,18 @@
+[Unit]
+Description=Tronloop ClusterPilot Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/tronloop/clusterpilot-engine/current
+ExecStart=/opt/tronloop/clusterpilot-engine/current/Tronloop.ClusterPilot.Engine
+User=debian
+Restart=always
+RestartSec=3
+Environment=DOTNET_ENVIRONMENT=Production
+Environment=Telemetry__DatabasePath=/var/lib/tronloop-clusterpilot-engine/telemetry.sqlite
+StateDirectory=tronloop-clusterpilot-engine
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

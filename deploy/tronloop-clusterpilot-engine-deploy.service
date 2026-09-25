@@ -1,0 +1,9 @@
+[Unit]
+Description=Build and deploy ClusterPilot Engine updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/tronloop/clusterpilot-engine/deploy-clusterpilot-engine.sh
+TimeoutStartSec=30min

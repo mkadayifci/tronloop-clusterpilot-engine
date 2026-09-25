@@ -1,0 +1,10 @@
+[Unit]
+Description=Check ClusterPilot Engine updates every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=tronloop-clusterpilot-engine-deploy.service
+
+[Install]
+WantedBy=timers.target
