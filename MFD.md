@@ -187,7 +187,7 @@ Doğrulama: `dotnet build --no-restore` hatasız/uyarısız tamamlandı. Geçici
 
 Önceki SQLite akışının yerini şu davranış alır:
 
-- `TelemetryPublisher.PublishAsync<T>` çözümlenen struct'ı binary olarak MQTT'ye gönderir. QoS 1 kullanılır; broker'ın başarılı publish cevabı alındığında metot döner, SQLite açılmaz/yazılmaz.
+- `MqttMessagePublisher.PublishAsync<T>` çözümlenen struct'ı binary olarak MQTT'ye gönderir. QoS 1 kullanılır; broker'ın başarılı publish cevabı alındığında metot döner, SQLite açılmaz/yazılmaz.
 - Bağlantı yoksa, publish sonucu başarısızsa, gönderim hata verirse veya 5 saniyelik gönderim süresi aşılırsa aynı tipli değer SQLite'a binary kaydedilir. Veritabanı ilk başarısız gönderimde oluşturulur.
 - Topic: `tronloop/{ClusterPilot:Id}/vertex-01/base-telemetry`. Kimlik `appsettings.json` içindeki `ClusterPilot:Id` ile belirlenir (varsayılan `clusterpilot-01`); `ClusterPilot__Id=clusterpilot-02` ortam değişkeni bu ayarı ezer. Örnek: `ClusterPilot__Id=clusterpilot-02 dotnet run`. Değişiklik uygulama yeniden başlatıldığında geçerli olur. Tam topic isteğe bağlı `Telemetry:MqttTopic` veya `Telemetry__MqttTopic` ile verilirse kimlikten üretilen topic yerine kullanılır. Sonuna CAN veya tür bilgisi eklenmez. MQTT payload'ı doğrudan struct'ın binary temsilidir. Bu kimlik telemetri topic'i içindir; Worker'ın mevcut `A0` komut/status kimliği ayrıdır.
 - Worker ve publisher aynı MQTT istemcisini kullanır. MQTT bağlantı/heartbeat hataları CAN alımını durdurmaz; Worker 5 saniyelik döngüde bağlantıyı yeniden dener.
@@ -217,19 +217,19 @@ SQLite kayıtlarında mevcut CAN arayüzü/RX/TX alanları korunur; VertexId ayr
 
 `Can:Devices` listesinde vertex-01–vertex-16 tanımlıdır; Pilot RX/TX çiftleri
 0x100/0x101 ile başlayıp 0x11E/0x11F ile biter. İlk üç cihaz aktif, diğerleri pasiftir.
-Her cihazın `IsActive` alanı listener açılıp açılmayacağını belirler. `false` olan
+Her cihazın `IsInstalled` alanı listener açılıp açılmayacağını belirler. `false` olan
 cihaz için socket veya dinleme görevi oluşturulmaz.
 Alan belirtilmezse eski konfigürasyonlarla uyum için `true` kabul edilir.
 Bu alan cihazın çevrimiçi durumunu değil, yapılandırmadaki etkinliğini gösterir.
-Örnek ortam değişkeni: `Can__Devices__3__IsActive=true` vertex-04 cihazını etkinleştirir.
+Örnek ortam değişkeni: `Can__Devices__3__IsInstalled=true` vertex-04 cihazını etkinleştirir.
 Değişiklik uygulama yeniden başlatıldığında geçerli olur.
 
 ## Listener durum takibi — 2026-09-24
 
-Yalnızca `IsActive=true` cihazlar için listener başlatılır.
-Tüm cihazlar mevcut `tronloop/orchestrator/A0/status` ve `/heartbeat` JSON
+Yalnızca `IsInstalled=true` cihazlar için listener başlatılır.
+Tüm cihazlar `tronloop/orchestrator/A0/status` ve `tronloop/{ClusterPilot:Id}/heartbeat` JSON
 mesajlarının `Devices` dizisinde raporlanır. Heartbeat mevcut 5 saniyelik döngüde,
-MQTT bağlantısı varken gönderilir. Her kayıt `VertexId`, `IsActive`,
+MQTT bağlantısı varken gönderilir. Her kayıt `VertexId`, `IsInstalled`,
 `ListenerState`, `ReceptionState`, `LastReceivedAtUtc`, `ReceivedPackets`,
 `LastError` içerir. Snapshot okumaları ve sayaç güncellemeleri kilitle korunur.
 
@@ -243,7 +243,7 @@ MQTT bağlantısı varken gönderilir. Her kayıt `VertexId`, `IsActive`,
   bağlantı düzelince korunur. Bu alanlar firmware'in batarya/state alanından ayrıdır.
 - Başlangıçta socket açılamazsa da listener görevinde yeniden deneme yapılır.
   Kapanışta socket kapatılır ve durum `stopped` olur.
-- Config aktifliği başlangıçta okunur; `IsActive` değişikliğinde yeniden başlatma gerekir.
+- Config aktifliği başlangıçta okunur; `IsInstalled` değişikliğinde yeniden başlatma gerekir.
 
 Doğrulama: build ve donanımdan bağımsız durum/geçiş kontrolleri;
 gerçek Linux CAN/ISO-TP bağlantısı ve MQTT tüketicisi ile entegrasyon testi yapılmadı.
@@ -255,3 +255,72 @@ Otomatik 12 baytlık dummy gönderim görevi ve `SendDummyCanMessagesAsync` meto
 kaldırıldı. Önceki bölümlerdeki dummy gönderim açıklamaları tarihsel durumu anlatır.
 CAN listener alımı ve yeniden bağlantı denemeleri devam eder; uygulama periyodik
 test payload'ı göndermez. ISO-TP flow-control için TX ID kullanılmaya devam eder.
+
+
+## VertexStatusPayload — 11 bayt firmware biçimi
+
+11 baytlık mesajlar artık `VertexStatusPayload` olarak çözümlenir; eski 7 baytlık
+`FastTelemetryPayload` desteği de korunur. Alan sırası: byte PayloadType,
+ushort BatteryVoltageMv, byte ScenarioPlayerState, byte ChargerMode,
+short BatteryCurrentMa, short BatteryTemperatureDc, short AmbientTemperatureDc.
+Çok baytlı alanlar açıkça little-endian okunur; struct Pack=1 ile 11 bayttır.
+Akımda artı şarj, eksi deşarj; sıcaklıklar derece C'nin onda biri birimindedir.
+Voltaj context değeridir, ölçüm güncellemesi henüz firmware'de uygulanmamıştır;
+charger mode donanım geri bildirimi değildir.
+
+Tür seçimi uzunluğa göredir. PAYLOAD_TYPE_GENERAL_STATUS ve enum sayısal değerleri
+verilmediği için PayloadType, ScenarioPlayerState ve ChargerMode ham byte olarak
+korunur; payload type doğrulaması yapılmaz. MQTT mevcut base-telemetry topic'ine
+binary yayınlar; SQLite fallback PayloadType kolonuna `VertexStatusPayload` yazar.
+Mevcut MemoryMarshal tabanlı binary yayın/kayıt, little-endian host varsayar.
+
+
+## Payload type tabanlı seçim
+
+Tür artık ilk bayttan seçilir: 0x01 FastTelemetry, 0x02 Heartbeat, 0x03 VertexStatus.
+Uzunluk yalnızca seçilen türün şemasını doğrular; boyuttan türe geri dönüş yoktur.
+FastTelemetry mevcut alanlarının önüne tür baytı eklenerek 8 bayt oldu;
+eski tür baytı olmayan 7 baytlık paketler desteklenmez. VertexStatus 11 bayttır.
+Her iki parser little-endian okur ve tür/boyut doğrular. MQTT/SQLite binary
+verisi tür baytını da içerir. Önceden kaydedilmiş 7 baytlık FastTelemetry kayıtları
+bu değişiklikle dönüştürülmez; okuyucular PayloadLength ile eski biçimi ayırmalıdır.
+Heartbeat kodu tanınır ancak gövde şeması henüz verilmediği için loglanıp atlanır.
+Bilinmeyen türler ve hatalı boyutlar da loglanıp atlanır; socket yeniden açılmaz.
+
+## ClusterPilot MQTT heartbeat — 2026-09-25
+
+ClusterPilot heartbeat'i `tronloop/{ClusterPilot:Id}/heartbeat` topic'ine JSON olarak
+gönderiyoruz. Mevcut ayarla topic `tronloop/clusterpilot-01/heartbeat` olur;
+`ClusterPilot__Id` ortam değişkeni hem topic'teki hem payload'daki kimliği değiştirir.
+Kimlik boş olamaz ve `/`, `+`, `#` veya NUL içeremez; başlangıçta doğrulanır.
+Kaynak: `Worker.cs`, `Models/ClusterPilotHeartbeat.cs`, `appsettings.json`.
+
+İlk MQTT bağlantısında hemen, ardından bağlantı varken 5 saniyelik timer ile
+yayımlanır. Bağlantı veya gönderim hatasında mevcut döngü yeniden dener;
+ağ işlemi uzarsa teslim aralığı da uzayabilir. Heartbeat'ler SQLite'a yazılmaz,
+birikmiş heartbeat'ler sonradan gönderilmez. QoS 0 kullanılır ve retained değildir.
+MQTT client ID'si `engine-{ClusterPilot:Id}` olduğundan farklı ClusterPilot
+kimlikleri aynı broker'a ayrı istemciler olarak bağlanır.
+
+JSON alanları `ClusterPilotId`, `State` (`alive`), `Devices` ve `TimestampUtc`'dir.
+`TimestampUtc` yayın hazırlanırken alınan UTC zamanıdır; `Devices` mevcut listener
+durumlarını içerir. Bu mesaj Engine'in çalıştığını bildirir, Vertex'lerin çevrimiçi
+olduğunu tek başına kanıtlamaz. MQTT istemcisinde tüm ClusterPilot heartbeat'lerini
+izlemek için `tronloop/+/heartbeat` konusuna abone olunabilir.
+
+Önceki `tronloop/orchestrator/A0/heartbeat` yayını bu topic'e taşındı;
+heartbeat tüketicileri topic'i ve `NodeId` yerine `ClusterPilotId` alanını kullanmalı.
+Komut, ack ve status topic'leri mevcut `A0` yapısında devam eder.
+
+Doğrulama: `dotnet build --no-restore` hatasız ve uyarısız geçti. Ağsız sahte MQTT
+istemcisiyle heartbeat'ler yaklaşık 0,05 / 5,03 / 10,03 saniyede gözlendi; topic,
+JSON alanları, istemci kimliği, geçersiz kimliklerin reddi ve temiz kapanış kontrol
+edildi. Gerçek broker/CAN bağlantısıyla entegrasyon testi yapılmadı.
+
+## Vertex status MQTT topic
+
+`VertexStatusPayload` artık varsayılan olarak
+`tronloop/{ClusterPilot:Id}/{VertexId}/vertex-status` topic'ine gönderilir.
+Diğer payload'larda mevcut `base-telemetry` son eki korunur.
+`Telemetry:MqttTopic` override'ı `{VertexId}` yanında `{MessageType}` yer tutucusunu
+kullanabilir. Tam sabit topic override'ı verilirse yine önceliklidir.

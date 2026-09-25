@@ -5,6 +5,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using MQTTnet;
+using Tronloop.ClusterPilot.Engine.Models;
 
 namespace Tronloop.ClusterPilot.Engine;
 
@@ -12,25 +13,33 @@ public sealed class Worker : BackgroundService
 {
     private readonly ILogger<Worker> _logger;
     private readonly IConfiguration _configuration;
-    private readonly TelemetryPublisher _telemetryPublisher;
+    private readonly MqttMessagePublisher _mqttMessagePublisher;
     private readonly IMqttClient _mqttClient;
+    private readonly string _clusterPilotId;
 
     private readonly List<CanDeviceStatus> _deviceStatuses = [];
     private TimeSpan _staleAfter;
 
     private const string NodeId = "A0";
+    private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(5);
 
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
 
-    public Worker(ILogger<Worker> logger, IConfiguration configuration, TelemetryPublisher telemetryPublisher, IMqttClient mqttClient)
+    public Worker(ILogger<Worker> logger, IConfiguration configuration, MqttMessagePublisher mqttMessagePublisher, IMqttClient mqttClient)
     {
         _logger = logger;
         _configuration = configuration;
-        _telemetryPublisher = telemetryPublisher;
+        _mqttMessagePublisher = mqttMessagePublisher;
         _mqttClient = mqttClient;
+        var clusterPilotId = configuration["ClusterPilot:Id"];
+        if (string.IsNullOrWhiteSpace(clusterPilotId) || clusterPilotId.IndexOfAny(['/', '+', '#', '\0']) >= 0)
+        {
+            throw new InvalidOperationException("ClusterPilot:Id must be a non-empty MQTT topic segment. Configure ClusterPilot:Id or the ClusterPilot__Id environment variable.");
+        }
+        _clusterPilotId = clusterPilotId;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -48,7 +57,7 @@ public sealed class Worker : BackgroundService
         var devices = _configuration.GetSection("Can:Devices").GetChildren()
             .Select(device => (
                 VertexId: device["VertexId"] ?? "",
-                IsActive: device.GetValue<bool>("IsActive", true),
+                IsInstalled: device.GetValue<bool>("IsInstalled", true),
                 RxId: ParseCanId(device["RxId"]),
                 TxId: ParseCanId(device["TxId"])))
             .ToList();
@@ -67,9 +76,9 @@ public sealed class Worker : BackgroundService
 
         foreach (var device in devices)
         {
-            var status = new CanDeviceStatus(device.VertexId, device.IsActive);
+            var status = new CanDeviceStatus(device.VertexId, device.IsInstalled);
             _deviceStatuses.Add(status);
-            if (!device.IsActive)
+            if (!device.IsInstalled)
             {
                 _logger.LogInformation("CAN listener inactive for {VertexId}", device.VertexId);
                 continue;
@@ -78,7 +87,7 @@ public sealed class Worker : BackgroundService
             try
             {
                 var canListener = new CanIsoTpListener(canInterface, device.RxId, device.TxId,
-                    device.VertexId, _logger, _telemetryPublisher, status);
+                    device.VertexId, _logger, _mqttMessagePublisher, status);
                 canListeners.Add(canListener);
                 canTasks.Add(canListener.ListenAsync(canCancellation.Token));
                 _logger.LogInformation("CAN ISO-TP listener started on {Device}", deviceLabel);
@@ -126,9 +135,10 @@ public sealed class Worker : BackgroundService
 
         var options = new MqttClientOptionsBuilder()
             .WithTcpServer("mqtt.tronloop-lab.com", 1883)
-            .WithClientId($"orchestrator-{NodeId}")
+            .WithClientId($"engine-{_clusterPilotId}")
             .Build();
 
+        using var heartbeatTimer = new PeriodicTimer(HeartbeatInterval);
         try
         {
             while (!stoppingToken.IsCancellationRequested)
@@ -155,7 +165,8 @@ public sealed class Worker : BackgroundService
                     _logger.LogWarning(ex, "MQTT unavailable; CAN reception continues with SQLite fallback.");
                 }
 
-                await Task.Delay(5000, stoppingToken);
+                if (!await heartbeatTimer.WaitForNextTickAsync(stoppingToken))
+                    break;
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -309,16 +320,11 @@ public sealed class Worker : BackgroundService
         IMqttClient client,
         CancellationToken cancellationToken)
     {
-        var heartbeat = new NodeStatus
-        {
-            NodeId = NodeId,
-            State = "alive",
-            Devices = GetDeviceSnapshots(),
-            TimestampUtc = DateTimeOffset.UtcNow
-        };
+        var heartbeat = new ClusterPilotHeartbeat(
+            _clusterPilotId, "alive", GetDeviceSnapshots(), DateTimeOffset.UtcNow);
 
         var message = new MqttApplicationMessageBuilder()
-            .WithTopic($"tronloop/orchestrator/{NodeId}/heartbeat")
+            .WithTopic($"tronloop/{_clusterPilotId}/heartbeat")
             .WithPayload(JsonSerializer.Serialize(heartbeat))
             .Build();
 

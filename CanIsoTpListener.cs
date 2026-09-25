@@ -1,3 +1,4 @@
+using Tronloop.ClusterPilot.Engine.Models;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 
@@ -25,14 +26,14 @@ public sealed class CanIsoTpListener : IDisposable
     private readonly uint _rxId;
     private readonly uint _txId;
     private readonly ILogger _logger;
-    private readonly TelemetryPublisher _telemetryPublisher;
+    private readonly MqttMessagePublisher _mqttMessagePublisher;
     private readonly CanDeviceStatus _status;
     private readonly object _sync = new();
 
     private int _socketFd = -1;
     private bool _disposed;
 
-    public CanIsoTpListener(string interfaceName, uint rxId, uint txId, string vertexId, ILogger logger, TelemetryPublisher telemetryPublisher, CanDeviceStatus status)
+    public CanIsoTpListener(string interfaceName, uint rxId, uint txId, string vertexId, ILogger logger, MqttMessagePublisher mqttMessagePublisher, CanDeviceStatus status)
     {
         _status = status;
         _interfaceName = interfaceName;
@@ -40,7 +41,7 @@ public sealed class CanIsoTpListener : IDisposable
         _rxId = rxId;
         _txId = txId;
         _logger = logger;
-        _telemetryPublisher = telemetryPublisher;
+        _mqttMessagePublisher = mqttMessagePublisher;
     }
 
     public void Open()
@@ -84,10 +85,14 @@ public sealed class CanIsoTpListener : IDisposable
                         {
                             var receivedAtUtc = DateTimeOffset.UtcNow;
                             _status.RecordReceived(receivedAtUtc);
-                            var telemetry = DeserializePayload(buffer.AsSpan(0, (int)bytesRead));
+                            if (!CanPackage.TryParse(buffer.AsSpan(0, (int)bytesRead), out var telemetry, out var error))
+                            {
+                                _logger.LogWarning("Vertex {VertexId}: {Error} Packet not stored.", _vertexId, error);
+                                continue;
+                            }
                             if (telemetry is FastTelemetryPayload fastTelemetry)
                             {
-                                await _telemetryPublisher.PublishAsync(
+                                await _mqttMessagePublisher.PublishAsync(
                                     _vertexId, _interfaceName, _rxId, _txId, receivedAtUtc,
                                     fastTelemetry, cancellationToken);
                                 _logger.LogInformation(
@@ -96,6 +101,18 @@ public sealed class CanIsoTpListener : IDisposable
                                     fastTelemetry.BatteryCurrentMa,
                                     fastTelemetry.BatteryTempDeciC / 10.0,
                                     fastTelemetry.State);
+                            }
+                            else if (telemetry is VertexStatusPayload vertexStatus)
+                            {
+                                await _mqttMessagePublisher.PublishAsync(
+                                    _vertexId, _interfaceName, _rxId, _txId, receivedAtUtc,
+                                    vertexStatus, cancellationToken);
+                                _logger.LogInformation(
+                                    "Vertex {VertexId} status: type={PayloadType}, context voltage={VoltageMv} mV, scenario={ScenarioState}, context charger mode={ChargerMode}, current={CurrentMa} mA, battery temp={BatteryTempC:F1} C, ambient temp={AmbientTempC:F1} C",
+                                    _vertexId, vertexStatus.PayloadType, vertexStatus.BatteryVoltageMv,
+                                    vertexStatus.ScenarioPlayerState, vertexStatus.ChargerMode,
+                                    vertexStatus.BatteryCurrentMa, vertexStatus.BatteryTemperatureDc / 10.0,
+                                    vertexStatus.AmbientTemperatureDc / 10.0);
                             }
                             else
                             {
@@ -144,16 +161,6 @@ public sealed class CanIsoTpListener : IDisposable
                 _status.SetState("stopped");
             }
         }, CancellationToken.None);
-    }
-
-    private static object? DeserializePayload(ReadOnlySpan<byte> payload)
-    {
-        if (payload.Length == Marshal.SizeOf<FastTelemetryPayload>())
-        {
-            return MemoryMarshal.Read<FastTelemetryPayload>(payload);
-        }
-
-        return null;
     }
 
     private void EnsureOpen()
@@ -342,13 +349,4 @@ public sealed class CanIsoTpListener : IDisposable
 
     [DllImport("libc", SetLastError = true)]
     private static extern int close(int fd);
-}
-
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-public readonly struct FastTelemetryPayload
-{
-    public readonly ushort BatteryVoltageMv;
-    public readonly short BatteryCurrentMa;
-    public readonly short BatteryTempDeciC;
-    public readonly byte State;
 }

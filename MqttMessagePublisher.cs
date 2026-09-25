@@ -2,12 +2,13 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using MQTTnet;
 using MQTTnet.Protocol;
+using Tronloop.ClusterPilot.Engine.Models;
 
 namespace Tronloop.ClusterPilot.Engine;
 
-public sealed class TelemetryPublisher(
+public sealed class MqttMessagePublisher(
     IMqttClient client, SqliteTelemetryStore store,
-    IConfiguration configuration, ILogger<TelemetryPublisher> logger)
+    IConfiguration configuration, ILogger<MqttMessagePublisher> logger)
 {
     private readonly string _topicTemplate = ResolveTopic(configuration);
 
@@ -25,7 +26,7 @@ public sealed class TelemetryPublisher(
             throw new InvalidOperationException("ClusterPilot:Id must be a non-empty MQTT topic segment. Configure ClusterPilot:Id or the ClusterPilot__Id environment variable.");
         }
 
-        return $"tronloop/{clusterPilotId}/{{VertexId}}/base-telemetry";
+        return $"tronloop/{clusterPilotId}/{{VertexId}}/{{MessageType}}";
     }
 
     public async Task PublishAsync<T>(
@@ -34,6 +35,10 @@ public sealed class TelemetryPublisher(
     {
         var binaryPayload = new byte[Unsafe.SizeOf<T>()];
         MemoryMarshal.Write(binaryPayload, in payload);
+        var messageType = typeof(T) == typeof(VertexStatusPayload) ? "vertex-status" : "base-telemetry";
+        var topic = _topicTemplate
+            .Replace("{VertexId}", vertexId, StringComparison.Ordinal)
+            .Replace("{MessageType}", messageType, StringComparison.Ordinal);
 
         try
         {
@@ -42,7 +47,7 @@ public sealed class TelemetryPublisher(
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeout.CancelAfter(TimeSpan.FromSeconds(5));
                 var message = new MqttApplicationMessageBuilder()
-                    .WithTopic(_topicTemplate.Replace("{VertexId}", vertexId, StringComparison.Ordinal))
+                    .WithTopic(topic)
                     .WithPayload(binaryPayload)
                     .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
                     .Build();
