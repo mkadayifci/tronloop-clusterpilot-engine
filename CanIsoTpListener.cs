@@ -11,6 +11,7 @@ public sealed class CanIsoTpListener : IDisposable
     private const int CAN_ISOTP = 6;
     private const int SOL_SOCKET = 1;
     private const int SO_RCVTIMEO = 20;
+    private const int SO_SNDTIMEO = 21;
 
     private const int EAGAIN = 11;
     private const int EWOULDBLOCK = 11;
@@ -20,6 +21,7 @@ public sealed class CanIsoTpListener : IDisposable
     private const int ETIMEDOUT = 110;
 
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan RtcSyncInterval = TimeSpan.FromMinutes(1);
 
     private readonly string _interfaceName;
     private readonly string _vertexId;
@@ -162,6 +164,37 @@ public sealed class CanIsoTpListener : IDisposable
         }, CancellationToken.None);
     }
 
+    public Task SynchronizeRtcAsync(CancellationToken cancellationToken)
+    {
+        return Task.Run(async () =>
+        {
+            using var timer = new PeriodicTimer(RtcSyncInterval);
+            byte sequence = 0;
+            try
+            {
+                do
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    try
+                    {
+                        Send(CanPackage.CreateRtcSet(DateTimeOffset.UtcNow, sequence));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Vertex {VertexId}: RTC_SET send failed; will retry next minute.", _vertexId);
+                    }
+                    sequence = unchecked((byte)(sequence + 1));
+                }
+                while (await timer.WaitForNextTickAsync(cancellationToken));
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Normal shutdown.
+            }
+        }, CancellationToken.None);
+    }
+
     private void EnsureOpen()
     {
         lock (_sync)
@@ -204,6 +237,12 @@ public sealed class CanIsoTpListener : IDisposable
                     $"Failed to set ISO-TP receive timeout (errno={Marshal.GetLastWin32Error()}).");
             }
 
+            if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, ref timeout, Marshal.SizeOf<Timeval>()) != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Failed to set ISO-TP send timeout (errno={Marshal.GetLastWin32Error()}).");
+            }
+
             var addr = new SockaddrCan
             {
                 CanFamily = AF_CAN,
@@ -235,20 +274,25 @@ public sealed class CanIsoTpListener : IDisposable
 
     public void Send(byte[] data)
     {
-        EnsureOpen();
-
-        var fd = GetSocketFd();
-        var bytesWritten = write(fd, data, data.Length);
-
-        if (bytesWritten < 0)
+        // Keep reconnect/dispose from closing or reusing the descriptor during a write.
+        lock (_sync)
         {
-            throw new InvalidOperationException(
-                $"ISO-TP write failed (errno={Marshal.GetLastWin32Error()}).");
-        }
+            EnsureOpen();
+            var bytesWritten = write(_socketFd, data, data.Length);
+            if (bytesWritten < 0)
+            {
+                throw new InvalidOperationException(
+                    $"ISO-TP write failed (errno={Marshal.GetLastWin32Error()}).");
+            }
+            if (bytesWritten != data.Length)
+            {
+                throw new InvalidOperationException(
+                    $"ISO-TP write incomplete: {bytesWritten} of {data.Length} bytes.");
+            }
 
-        var hex = Convert.ToHexString(data, 0, (int)bytesWritten);
-        Console.WriteLine($"[ISO-TP] {DateTime.Now:HH:mm:ss.fff} -> {hex}");
-        _logger.LogInformation("ISO-TP TX [{Length} bytes]: {Hex}", bytesWritten, hex);
+            _logger.LogInformation("Vertex {VertexId}: ISO-TP TX [{Length} bytes]: {Hex}",
+                _vertexId, bytesWritten, Convert.ToHexString(data));
+        }
     }
 
     private int GetSocketFd()

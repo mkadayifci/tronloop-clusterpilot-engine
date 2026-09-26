@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using Tronloop.ClusterPilot.Engine.Models;
 namespace Tronloop.ClusterPilot.Engine;
 
@@ -8,8 +9,24 @@ public enum PayloadType : byte
     VertexStatus = 0x03
 }
 
+public enum TlpCommand : byte
+{
+    RtcSet = 0x01
+}
+
 public static class CanPackage
 {
+    private const byte TlpVersion = 0x01;
+
+    public static byte[] CreateRtcSet(DateTimeOffset timestamp, byte sequence)
+    {
+        // TlpHeader: command, version, sequence, flags; payload: uint32 Unix seconds.
+        byte[] packet = [(byte)TlpCommand.RtcSet, TlpVersion, sequence, 0x00, 0, 0, 0, 0];
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(4),
+            checked((uint)timestamp.ToUnixTimeSeconds()));
+        return packet;
+    }
+
     public static bool TryParse(ReadOnlySpan<byte> payload, out object? value, out string? error)
     {
         value = null;

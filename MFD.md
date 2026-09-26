@@ -7,22 +7,46 @@ Paket 13 bayt: byte tür (0x01), ushort mV, short mA, ulong Unix ms.
 Çok baytlı alanlar little-endian; `MeasurementTimeMs` ofseti 5. Eski 8 baytlık
 `FastTelemetryPayload` modeli kaldırıldı. Sıcaklık ve State telemetride yok.
 
-MQTT topic’i `tronloop/{ClusterPilot:Id}/{VertexId}/base-telemetry` olarak kaldı.
+MQTT topic’i `tronloop/{ClusterPilot:Id}/{VertexId}/vertex-telemetry`.
 JSON alanları `PayloadType`, `BatteryVoltageMv`, `BatteryCurrentMa`,
 `MeasurementTimeMs`. RTC’den gelen zaman değiştirilmeden yayınlanıyor. Başarısız
 yayında SQLite 13 baytı ve yeni tür adını saklıyor. Eski BLOB’lar dönüştürülmüyor;
 yeniden gönderici eski/yeni tür ve boyutu ayırmalı.
 
+`MqttMessagePublisher` model türünü açıkça eşliyor: `VertexTelemetryPayload`
+`vertex-telemetry`, `VertexStatusPayload` `vertex-status` son ekini kullanıyor.
+Diğer türler `NotSupportedException` ile reddediliyor; MQTT yayını veya SQLite
+kaydı yapılmıyor. Önceki `base-telemetry` abonelikleri `vertex-telemetry` olarak
+güncellenmeli. Tam sabit `Telemetry:MqttTopic` override'ı kendi topic'ini korur;
+`{MessageType}` içeren şablonlar yeni adı kullanır. Bu adlandırma firmware'in
+0x01 tür baytını, 13 baytlık düzenini veya JSON ölçüm alanlarını değiştirmez.
+
+Her iki Vertex yayını UTF-8 JSON ve QoS 1 kullanır. Vertex status için mevcut
+MQTT 5 `MessageExpiryInterval=15` saniye ve gönderilemeyen status'ü SQLite'a
+yazmadan atlama davranışı korunur. Telemetriye expiry eklenmez; başarısız
+telemetri yayını binary SQLite fallback'e gider.
+Kaynak: `MqttMessagePublisher.cs`, `Models/VertexTelemetryPayload.cs`,
+`Models/VertexStatusPayload.cs`, `CanPackage.cs`.
+
+Topic değişikliği doğrulaması: Engine derlemesi 0 hata ve 1 NU1900 NuGet erişim
+uyarısıyla tamamlandı. Ağsız 10 kontrolde açık tür eşlemesi, JSON/RTC zamanı,
+topic override'ı, status expiry/kayıt davranışı, 13 bayt SQLite telemetri kaydı ve
+desteklenmeyen tür reddi doğrulandı. Ingestor'ın aboneliği ve topic doğrulaması da
+`vertex-telemetry` olarak güncellendi; izole kopyada mevcut 24 kontrol geçti.
+Canlı broker/CAN denemesi veya dağıtım yapılmadı.
+
 Bu bölüm telemetri için aşağıdaki eski 7/8/11 bayt değerlendirmelerinin yerine geçer.
-Aşağıdaki önceki incelemeler tarihçe olarak korunuyor. Yerel derleme ve 22 davranış
-kontrolü geçti: paket boyut/ofseti, signed akım, uint64 zaman, JSON çıkışı, SQLite
+Aşağıdaki önceki incelemeler tarihçe olarak korunuyor. 13 bayt modele geçişte,
+topic adı değişmeden önce yapılan yerel derleme ve 22 davranış kontrolü geçti:
+paket boyut/ofseti, signed akım, uint64 zaman, JSON çıkışı, SQLite
 BLOB ve status/heartbeat regresyonları. MQTT istemcisi taklit edildi, SQLite gerçek
 geçici dosyada denendi. NuGet güvenlik verisi sorgusunda NU1900 erişim uyarısı vardı.
 Canlı broker/CAN denemesi ve canlıya dağıtım yapılmadı.
 
 
 
-Son inceleme: 2026-09-18.
+İlk inceleme: 2026-09-18. Aşağıdaki ilk inceleme notları o tarihteki durumu anlatır;
+güncel telemetri modeli ve topic'i için 2026-09-25 bölümleri geçerlidir.
 
 Bu dosya, sonraki geliştirmelerde kullanılacak proje bağlamını, mevcut kodun durumunu ve firmware ile uzlaştırılması gereken protokol ayrıntılarını tutar. Kaynaklar: bu depodaki C# dosyaları ve kullanıcının firmware agentından aktardığı açıklama. Firmware kaynakları veya gerçek CAN trafiği bu incelemede doğrulanmadı. Aşağıdaki öneriler henüz uygulanmış özellikler değildir.
 
@@ -174,7 +198,9 @@ Parser uygulanırken doğrulanmış örnek payload'lar, negatif akım/sıcaklık
 
 ## SQLite binary kayıt — 2026-09-18 güncellemesi
 
-Bu bölüm yukarıdaki ilk kod incelemesinin kayıt/parser hakkındaki durumunu günceller.
+Bu bölüm 2026-09-18'deki kayıt/parser uygulamasının tarihçesidir. Aşağıdaki 7 baytlık
+model, örnek ve testler o sürüme aittir; güncel telemetri kaydı 13 baytlık
+`VertexTelemetryPayload` içerir. Status artık SQLite fallback'e yazılmaz.
 
 - Uzunluğa göre çözümleme `CanIsoTpListener.DeserializePayload` metoduna taşındı. Mevcut 7 baytlık `FastTelemetryPayload` biçimi korunuyor; 11 baytlık firmware biçimi henüz uygulanmadı. Desteklenmeyen uzunluklar uyarıyla atlanır.
 - Çözümlenen struct, `SqliteTelemetryStore.SaveAsync<T>` içinde `MemoryMarshal.Write` ile binary olarak serialize edilir (`T : unmanaged`). JSON ve ölçüm kolonları yoktur.
@@ -210,11 +236,11 @@ Doğrulama: `dotnet build --no-restore` hatasız/uyarısız tamamlandı. Geçici
 2026-09-18'de eklenen MQTT öncelikli gönderim akışını koruyoruz. 2026-09-25'ten
 itibaren MQTT payload'ı UTF-8 JSON; CAN verisi ve SQLite fallback kaydı binary kalır.
 Kaynak: `MqttMessagePublisher.cs`, `Models/VertexStatusPayload.cs`,
-`Models/FastTelemetryPayload.cs`, `SqliteTelemetryStore.cs`.
+`Models/VertexTelemetryPayload.cs`, `SqliteTelemetryStore.cs`.
 
 - `MqttMessagePublisher.PublishAsync<T>` çözümlenen struct'ı UTF-8 JSON olarak MQTT'ye gönderir. `JsonSerializerOptions.IncludeFields=true` ile public readonly alanlar da yazılır; PascalCase alan adları ve sayısal değerler korunur. QoS 1 kullanılır; broker'ın başarılı publish cevabı alındığında metot döner, SQLite açılmaz/yazılmaz.
-- Bağlantı yoksa, publish sonucu başarısızsa, gönderim hata verirse veya 5 saniyelik gönderim süresi aşılırsa aynı tipli değer SQLite'a binary kaydedilir. Veritabanı ilk başarısız gönderimde oluşturulur.
-- Topic: `tronloop/{ClusterPilot:Id}/{VertexId}/{MessageType}`. `VertexStatusPayload` için son bölüm `vertex-status`, `FastTelemetryPayload` için `base-telemetry` olur. Kimlik `appsettings.json` içindeki `ClusterPilot:Id` ile belirlenir (varsayılan `clusterpilot-01`); `ClusterPilot__Id=clusterpilot-02` ortam değişkeni bu ayarı ezer. Örnek: `ClusterPilot__Id=clusterpilot-02 dotnet run`. Değişiklik uygulama yeniden başlatıldığında geçerli olur. `Telemetry:MqttTopic` veya `Telemetry__MqttTopic` override'ı verilirse varsayılan topic yerine kullanılır; `{VertexId}` ve `{MessageType}` yer tutucuları desteklenir. Kaynak kimlikleri topic'tedir; telemetri JSON'una ayrıca kimlik veya zaman damgası eklenmez. Worker'ın mevcut `A0` komut/status kimliği ayrıdır.
+- Bağlantı yoksa, publish sonucu başarısızsa, gönderim hata verirse veya 5 saniyelik gönderim süresi aşılırsa `VertexTelemetryPayload` SQLite'a 13 bayt binary olarak kaydedilir. Veritabanı ilk başarısız telemetri gönderiminde oluşturulur. `VertexStatusPayload` güncel durumu taşır: MQTT 5 expiry değeri 15 saniyedir, gönderilemeyen status SQLite'a kaydedilmez; sonraki CAN status'ü beklenir.
+- Topic: `tronloop/{ClusterPilot:Id}/{VertexId}/{MessageType}`. Açık tür eşlemesinde `VertexStatusPayload` için son bölüm `vertex-status`, `VertexTelemetryPayload` için `vertex-telemetry` olur. Desteklenmeyen tür `NotSupportedException` ile yayın ve kayıt yapılmadan reddedilir. Kimlik `appsettings.json` içindeki `ClusterPilot:Id` ile belirlenir (varsayılan `clusterpilot-01`); `ClusterPilot__Id=clusterpilot-02` ortam değişkeni bu ayarı ezer. Örnek: `ClusterPilot__Id=clusterpilot-02 dotnet run`. Değişiklik uygulama yeniden başlatıldığında geçerli olur. `Telemetry:MqttTopic` veya `Telemetry__MqttTopic` override'ı verilirse varsayılan topic yerine kullanılır; `{VertexId}` ve `{MessageType}` yer tutucuları desteklenir. Kaynak kimlikleri topic'tedir; telemetri JSON'undaki `MeasurementTimeMs` firmware RTC'sinden gelir, ayrıca PC zaman damgası eklenmez. Worker'ın mevcut `A0` komut/status kimliği ayrıdır.
 - Worker ve publisher aynı MQTT istemcisini kullanır. MQTT bağlantı/heartbeat hataları CAN alımını durdurmaz; Worker 5 saniyelik döngüde bağlantıyı yeniden dener.
 - Başarı broker onayıdır; tüketicinin işlemi tamamladığının onayı değildir. Broker mesajı alıp onayı kaybolursa SQLite fallback aynı mesajı tekrar göndermeye yol açabilir.
 - SQLite'taki eski kayıtlar bu publisher tarafından okunmaz, gönderilmez veya değiştirilmez. Bunları gönderecek ayrı servis için önceki `SentAtUtc` sözleşmesi geçerlidir.
@@ -229,7 +255,8 @@ Aynı `can0` üzerinde vertex-01 için 0x100/0x101, vertex-02 için 0x102/0x103,
 vertex-03 için 0x104/0x105 tanımlanmıştır. Kullanılmayan cihaz kayıtları kaldırılabilir.
 Kimlikler ve CAN ID'leri cihazlar arasında benzersiz olmalıdır.
 
-Telemetri topic'i artık `tronloop/{ClusterPilot:Id}/{VertexId}/base-telemetry` olarak üretilir.
+Telemetri topic'i 2026-09-25 adlandırmasıyla
+`tronloop/{ClusterPilot:Id}/{VertexId}/vertex-telemetry` olarak üretilir.
 `Telemetry:MqttTopic` override'ında `{VertexId}` yer tutucusu kullanılabilir;
 sabit topic verilirse tüm cihazlar o topic'e yayın yapar.
 Ortam değişkeni örnekleri: `ClusterPilot__Id=clusterpilot-02`,
@@ -286,7 +313,8 @@ test payload'ı göndermez. ISO-TP flow-control için TX ID kullanılmaya devam 
 
 Bu bölüm ilk uygulamayı anlatır. Uzunluğa göre tür seçimi ve 7 baytlık eski
 FastTelemetry desteği aşağıdaki payload type güncellemesiyle kaldırıldı;
-buradaki binary MQTT yayını da 2026-09-25'te JSON ile değiştirildi.
+buradaki binary MQTT yayını da 2026-09-25'te JSON ile değiştirildi. Aşağıdaki
+status SQLite fallback anlatımı da tarihçedir; güncel status gönderilemezse atlanır.
 
 11 baytlık mesajlar artık `VertexStatusPayload` olarak çözümlenir; eski 7 baytlık
 `FastTelemetryPayload` desteği de korunur. Alan sırası: byte PayloadType,
@@ -305,6 +333,10 @@ Mevcut MemoryMarshal tabanlı binary yayın/kayıt, little-endian host varsayar.
 
 
 ## Payload type tabanlı seçim
+
+Bu bölüm 8 baytlık ara telemetri şemasının tarihçesidir. Güncel 0x01 paketi,
+üstte açıklanan 13 baytlık `VertexTelemetryPayload` modelidir; eski 7/8 baytlık
+paketler desteklenmez. Tür baytıyla seçim ve uzunluk doğrulaması devam eder.
 
 Tür artık ilk bayttan seçilir: 0x01 FastTelemetry, 0x02 Heartbeat, 0x03 VertexStatus.
 Uzunluk yalnızca seçilen türün şemasını doğrular; boyuttan türe geri dönüş yoktur.
@@ -373,11 +405,14 @@ istemcisiyle heartbeat'ler yaklaşık 0,05 / 5,03 / 10,03 saniyede gözlendi; to
 JSON alanları, istemci kimliği, geçersiz kimliklerin reddi ve temiz kapanış kontrol
 edildi. Gerçek broker/CAN bağlantısıyla entegrasyon testi yapılmadı.
 
-## Vertex status MQTT topic ve JSON payload — 2026-09-25
+## Vertex MQTT topic'leri ve JSON payload — 2026-09-25
 
 `VertexStatusPayload` artık varsayılan olarak
 `tronloop/{ClusterPilot:Id}/{VertexId}/vertex-status` topic'ine gönderilir.
-Diğer payload'larda mevcut `base-telemetry` son eki korunur.
+`VertexTelemetryPayload` için topic
+`tronloop/{ClusterPilot:Id}/{VertexId}/vertex-telemetry` olur. Desteklenmeyen
+model türü varsayılan bir telemetri topic'ine düşmez; yayın ve kayıt yapılmadan
+`NotSupportedException` ile reddedilir.
 `Telemetry:MqttTopic` override'ı `{VertexId}` yanında `{MessageType}` yer tutucusunu
 kullanabilir. Tam sabit topic override'ı verilirse yine önceliklidir.
 
@@ -401,18 +436,35 @@ korunur; pozitif şarj, negatif deşarjdır. `ScenarioPlayerState` ve `ChargerMo
 ham sayısal kodlardır; bu örnek kodlara bir durum adı atamaz. Voltaj ve charger mode
 context alanlarıdır; tek başına ölçümün veya donanım geri bildiriminin kanıtı değildir.
 
-`FastTelemetryPayload` da `base-telemetry` topic'inde UTF-8 JSON gönderilir;
-alanları `PayloadType` (`1`), `BatteryVoltageMv`, `BatteryCurrentMa`,
-`BatteryTempDeciC` ve `State`'tir. Her iki payload'da public readonly alanlar
+`tronloop/clusterpilot-01/vertex-01/vertex-telemetry` için örnek payload:
+
+```json
+{
+  "PayloadType": 1,
+  "BatteryVoltageMv": 3700,
+  "BatteryCurrentMa": -250,
+  "MeasurementTimeMs": 1790326800000
+}
+```
+
+`VertexTelemetryPayload` alanları `PayloadType` (`1`), `BatteryVoltageMv`,
+`BatteryCurrentMa` ve `MeasurementTimeMs`'dir. Son alan Vertex RTC'sinden gelen
+Unix milisaniyesidir; Engine bunu PC alım zamanı ile değiştirmez. Telemetride
+sıcaklık ve `State` alanı yoktur. Her iki Vertex payload'ında public readonly alanlar
 `IncludeFields=true` ile seri hale gelir; `WireSize` sabiti JSON'a yazılmaz.
 Kaynak: `MqttMessagePublisher.cs`, `Models/VertexStatusPayload.cs`,
-`Models/FastTelemetryPayload.cs`.
+`Models/VertexTelemetryPayload.cs`.
 
-Bu değişiklik MQTT tüketicisinin payload çözümlemesini etkiler: aynı topic'lerde
-artık struct baytları yerine JSON okunmalıdır. CAN paket düzeni, topic seçimi,
-QoS 1 ve başarısız yayındaki binary SQLite fallback davranışı korunur.
+Önceki `base-telemetry` topic'ini dinleyen tüketici artık `vertex-telemetry`ye
+abone olmalıdır. JSON, QoS 1 ve mevcut 13 baytlık CAN telemetri düzeni korunur.
+Telemetri için expiry yoktur ve gönderim başarısızlığında binary SQLite fallback
+çalışır. Vertex status'ün 15 saniyelik MQTT 5 expiry değeri ve gönderilemeyen
+status'ü SQLite'a yazmadan atlama davranışı devam eder.
 
-Doğrulama: `dotnet build --no-restore` hatasız ve uyarısız geçti. Ağsız MQTT
+İlk JSON geçişinin tarihsel doğrulaması: `dotnet build --no-restore` hatasız ve
+uyarısız geçti. Bu kontrol eski 8 bayt telemetri ve status'ün SQLite'a yazıldığı
+önceki davranışa aittir; güncel 13 bayt telemetri/topic değişikliğinin testi değildir.
+Ağsız MQTT
 istemcisiyle iki modelin UTF-8 JSON alanları, negatif sayıları, topic override'ları,
 QoS 1 ve başarılı yayında veritabanı oluşturulmaması kontrol edildi. Bağlantısız,
 reddedilen ve hata veren gönderimlerde SQLite BLOB'larının orijinal 11/8 baytı

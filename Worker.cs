@@ -91,6 +91,7 @@ public sealed class Worker : BackgroundService
                     device.VertexId, _logger, _mqttMessagePublisher, status);
                 canListeners.Add(canListener);
                 canTasks.Add(canListener.ListenAsync(canCancellation.Token));
+                canTasks.Add(canListener.SynchronizeRtcAsync(canCancellation.Token));
                 _logger.LogInformation("CAN ISO-TP listener started on {Device}", deviceLabel);
             }
             catch (Exception ex)

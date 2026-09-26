@@ -40,8 +40,12 @@ public sealed class MqttMessagePublisher(
         string vertexId, string canInterface, uint rxId, uint txId, DateTimeOffset receivedAtUtc,
         T payload, CancellationToken cancellationToken) where T : unmanaged
     {
-        var isStatus = typeof(T) == typeof(VertexStatusPayload);
-        var messageType = isStatus ? "vertex-status" : "base-telemetry";
+        var (messageType, isStatus) = payload switch
+        {
+            VertexTelemetryPayload => ("vertex-telemetry", false),
+            VertexStatusPayload => ("vertex-status", true),
+            _ => throw new NotSupportedException($"Unsupported MQTT payload type: {typeof(T).Name}.")
+        };
         var topic = _topicTemplate
             .Replace("{VertexId}", vertexId, StringComparison.Ordinal)
             .Replace("{MessageType}", messageType, StringComparison.Ordinal);
