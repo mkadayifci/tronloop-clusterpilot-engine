@@ -4,7 +4,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Tronloop.ClusterPilot.Engine;
 
-public sealed class CanIsoTpListener : IDisposable
+public sealed class CanIsoTpListener : IDisposable, Scenarios.IScenarioTransport
 {
     private const int AF_CAN = 29;
     private const int SOCK_DGRAM = 2;
@@ -45,6 +45,8 @@ public sealed class CanIsoTpListener : IDisposable
         _logger = logger;
         _mqttMessagePublisher = mqttMessagePublisher;
     }
+
+    public event Action<byte[]>? ScenarioAck;
 
     public void Open()
     {
@@ -87,6 +89,11 @@ public sealed class CanIsoTpListener : IDisposable
                         {
                             var receivedAtUtc = DateTimeOffset.UtcNow;
                             _status.RecordReceived(receivedAtUtc);
+                            if (buffer[0] == Scenarios.ScenarioProtocol.AckType)
+                            {
+                                ScenarioAck?.Invoke(buffer.AsSpan(0, (int)bytesRead).ToArray());
+                                continue;
+                            }
                             if (!CanPackage.TryParse(buffer.AsSpan(0, (int)bytesRead), out var telemetry, out var error))
                             {
                                 _logger.LogWarning("Vertex {VertexId}: {Error} Packet not stored.", _vertexId, error);
