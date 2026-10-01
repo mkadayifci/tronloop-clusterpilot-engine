@@ -89,7 +89,7 @@ public sealed class CanIsoTpListener : IDisposable, Scenarios.IScenarioTransport
                         {
                             var receivedAtUtc = DateTimeOffset.UtcNow;
                             _status.RecordReceived(receivedAtUtc);
-                            if (buffer[0] == Scenarios.ScenarioProtocol.AckType)
+                            if (buffer[0] == Scenarios.ScenarioProtocol.AckType || buffer[0] == Scenarios.RamProfileProtocol.ResponseType)
                             {
                                 ScenarioAck?.Invoke(buffer.AsSpan(0, (int)bytesRead).ToArray());
                                 continue;

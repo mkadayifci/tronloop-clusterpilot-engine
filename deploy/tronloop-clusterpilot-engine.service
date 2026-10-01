@@ -11,6 +11,7 @@ Restart=always
 RestartSec=3
 Environment=DOTNET_ENVIRONMENT=Production
 Environment=Telemetry__DatabasePath=/var/lib/tronloop-clusterpilot-engine/telemetry.sqlite
+Environment=Scenarios__DatabasePath=/var/lib/tronloop-clusterpilot-engine/scenario-uploads.sqlite
 StateDirectory=tronloop-clusterpilot-engine
 StateDirectoryMode=0750
 

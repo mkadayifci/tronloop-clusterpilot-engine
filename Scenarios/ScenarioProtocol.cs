@@ -14,6 +14,7 @@ public sealed record CompiledScenario(byte[] Records, byte Entry, byte Count)
 }
 public static class ScenarioProtocol
 {
+    public const int MaxSteps = 64;
     public const byte Upload = 0x12, AckType = 0x04;
     public static byte[] Packet(Guid commandId, CompiledScenario program)
     {
@@ -55,7 +56,7 @@ public static class ScenarioProtocol
     {
         if(schema is not (2 or 3)) throw new ArgumentException("Only profile schemas 2 and 3 are supported.");
         List<byte[]> records = []; HashSet<string> ids = []; int total=0;
-        byte Add(byte action) { if(records.Count>=32)throw new ArgumentException("Compiled scenario exceeds 32 steps (including STOP)."); records.Add(new byte[16]); records[^1][0]=action;return (byte)(records.Count-1); }
+        byte Add(byte action) { if(records.Count>=MaxSteps)throw new ArgumentException("Compiled scenario exceeds 64 steps (including STOP)."); records.Add(new byte[16]); records[^1][0]=action;return (byte)(records.Count-1); }
         var stop=Add(3);
         byte Walk(JsonElement list, byte next, int depth)
         {

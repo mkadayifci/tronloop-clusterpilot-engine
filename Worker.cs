@@ -19,6 +19,7 @@ public sealed class Worker : BackgroundService
     private readonly IMqttClient _mqttClient;
     private readonly string _clusterPilotId;
     private readonly Scenarios.ScenarioUploader _uploader;
+    private readonly Scenarios.RamProfileReader _ramProfileReader;
 
     private readonly List<CanDeviceStatus> _deviceStatuses = [];
     private TimeSpan _staleAfter;
@@ -31,10 +32,11 @@ public sealed class Worker : BackgroundService
         PropertyNameCaseInsensitive = true
     };
 
-    public Worker(ILogger<Worker> logger, IConfiguration configuration, MqttMessagePublisher mqttMessagePublisher, IMqttClient mqttClient, Scenarios.ScenarioUploader uploader)
+    public Worker(ILogger<Worker> logger, IConfiguration configuration, MqttMessagePublisher mqttMessagePublisher, IMqttClient mqttClient, Scenarios.ScenarioUploader uploader, Scenarios.RamProfileReader ramProfileReader)
     {
         _logger = logger;
         _uploader = uploader;
+        _ramProfileReader = ramProfileReader;
         _configuration = configuration;
         _mqttMessagePublisher = mqttMessagePublisher;
         _mqttClient = mqttClient;
@@ -94,6 +96,7 @@ public sealed class Worker : BackgroundService
                     device.VertexId, _logger, _mqttMessagePublisher, status);
                 canListeners.Add(canListener);
                 _uploader.Attach(device.VertexId, canListener);
+                _ramProfileReader.Attach(device.VertexId, canListener);
                 canTasks.Add(canListener.ListenAsync(canCancellation.Token));
                 canTasks.Add(canListener.SynchronizeRtcAsync(canCancellation.Token));
                 _logger.LogInformation("CAN ISO-TP listener started on {Device}", deviceLabel);
@@ -110,6 +113,11 @@ public sealed class Worker : BackgroundService
         client.ApplicationMessageReceivedAsync += async e =>
         {
             var topic = e.ApplicationMessage.Topic;
+            if (topic.StartsWith($"tronloop/{_clusterPilotId}/", StringComparison.Ordinal) && topic.EndsWith("/scenario/profile/query", StringComparison.Ordinal))
+            {
+                _ramProfileReader.Receive(topic, e.ApplicationMessage.Payload.ToArray(), e.ApplicationMessage.Retain);
+                return;
+            }
             if(topic.StartsWith($"tronloop/{_clusterPilotId}/", StringComparison.Ordinal) && topic.EndsWith("/scenario/upload", StringComparison.Ordinal))
             {
                 await _uploader.ReceiveAsync(topic, e.ApplicationMessage.Payload.ToArray(), e.ApplicationMessage.Retain);
@@ -163,7 +171,8 @@ public sealed class Worker : BackgroundService
                         await client.SubscribeAsync($"tronloop/node/{NodeId}/cmd", cancellationToken: stoppingToken);
                         await client.SubscribeAsync("tronloop/broadcast/cmd", cancellationToken: stoppingToken);
                         var scenarioSubscription = await client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder()
-                            .WithTopicFilter($"tronloop/{_clusterPilotId}/+/scenario/upload", MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce).Build(), stoppingToken);
+                            .WithTopicFilter($"tronloop/{_clusterPilotId}/+/scenario/upload", MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
+                            .WithTopicFilter($"tronloop/{_clusterPilotId}/+/scenario/profile/query", MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce).Build(), stoppingToken);
                         if(scenarioSubscription.Items.Any(i => (int)i.ResultCode >= 128)) { await client.DisconnectAsync(); throw new InvalidOperationException("Scenario subscription rejected"); }
                         _logger.LogInformation("MQTT Connected-Subscribed");
                     }

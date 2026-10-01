@@ -6,6 +6,8 @@ builder.Services.AddSingleton<MQTTnet.IMqttClient>(_ => new MQTTnet.MqttClientFa
 builder.Services.AddSingleton<MqttMessagePublisher>();
 builder.Services.AddSingleton<Tronloop.ClusterPilot.Engine.Scenarios.ScenarioUploader>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<Tronloop.ClusterPilot.Engine.Scenarios.ScenarioUploader>());
+builder.Services.AddSingleton<Tronloop.ClusterPilot.Engine.Scenarios.RamProfileReader>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<Tronloop.ClusterPilot.Engine.Scenarios.RamProfileReader>());
 builder.Services.AddHostedService<Worker>();
 
 var host = builder.Build();
